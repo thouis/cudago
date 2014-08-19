@@ -1,6 +1,7 @@
 #include <curand_kernel.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <assert.h>
 
 // We want to be able to hold a board in shared memory
 
@@ -17,7 +18,7 @@
 #define BLACK_ALIVE 4
 #define WHITE_ALIVE 5
 
-const char stone_chars[] = ".BW#";
+const char stone_chars[] = ".#o ";
 
 typedef struct board {
     struct row {
@@ -32,11 +33,42 @@ typedef struct board {
 #define STONE_AT(b, r, c) ((b)->rows[r].s[c])
 #define SET_STONE_AT(b, r, c, v) ((b)->rows[r].s[c] = v)
 
+#define OPPOSITE(color) ((color == WHITE) ? BLACK : WHITE)
+
 // XXX - TODO:
 // - define SINGLE_REAL_EYE = SINGLE_EYE and (! FALSE_EYE) - see pachi's defn.
 // - add dead group removal -- flood fill aliveness - how many iterations and how to parallelize?
 
-#define SINGLE_REAL_EYE(b, r, c) (0)
+// SINGLE EYE == 4 horizontal & vertical neighbors are all the right color, or edge.
+#define COLOR_OR_EDGE_as_1(b, r, c, color) (((STONE_AT(b, r, c) == color) ? 1 : 0) +  \
+                                            ((STONE_AT(b, r, c) == EDGE) ? 1 : 0))
+
+#define SINGLE_EYE(b, r, c, color) ((COLOR_OR_EDGE_as_1(b, r + 1, c, color) +     \
+                                     COLOR_OR_EDGE_as_1(b, r - 1, c, color) +     \
+                                     COLOR_OR_EDGE_as_1(b, r, c + 1, color) +     \
+                                     COLOR_OR_EDGE_as_1(b, r, c - 1, color)) == 4)
+
+
+// FALSE_EYE is only valid if SINGLE_EYE is true
+// - >= two diagonal neighbors are opposite color, or
+// - 1 diagonal neighbor opposite color and at edge
+#define DIAG_NEIGHBORS(b, r, c, color) (((STONE_AT(b, r + 1, c + 1) == color) ? 1 : 0) + \
+                                        ((STONE_AT(b, r + 1, c - 1) == color) ? 1 : 0) + \
+                                        ((STONE_AT(b, r - 1, c + 1) == color) ? 1 : 0) + \
+                                        ((STONE_AT(b, r - 1, c - 1) == color) ? 1 : 0))
+
+#define AT_EDGE(b, r, c) ((STONE_AT(b, r + 1, c) == EDGE) || \
+                          (STONE_AT(b, r - 1, c) == EDGE) || \
+                          (STONE_AT(b, r, c + 1) == EDGE) || \
+                          (STONE_AT(b, r, c - 1) == EDGE))
+
+#define FALSE_EYE(b, r, c, color)  ((DIAG_NEIGHBORS(b, r, c, OPPOSITE(color)) >= 2) || \
+                                    ((DIAG_NEIGHBORS(b, r, c, OPPOSITE(color)) == 1) && AT_EDGE(b, r, c)))
+
+
+// Real single eyes = single eye, and not false.  Fails for some cases
+// (see Two-headed dragon @ sensei's library).
+#define SINGLE_REAL_EYE(b, r, c, color) (SINGLE_EYE(b, r, c, color) && (! FALSE_EYE(b, r, c, color)))
 
 __global__ void clear_board(Board *b)
 {
@@ -74,7 +106,7 @@ __global__ void make_random_move(Board *b,
     valid_move_mask = 0;
 
     for (int c = 1; c <= 19; c++) {
-        if ((STONE_AT(b, row, c) == EMPTY) && (! SINGLE_REAL_EYE(b, row, c))) {
+        if ((STONE_AT(b, row, c) == EMPTY) && (! SINGLE_REAL_EYE(b, row, c, color))) {
             valid_move_mask |= (1 << c);
             num_valid_moves++;
         }
@@ -118,12 +150,9 @@ __global__ void make_random_move(Board *b,
             which_move--;
         } while (which_move >= 0);
 
-        printf("placed at %d %d\n", which_row, which_col);
-        SET_STONE_AT(b, which_row, which_col, color);
-    }
-
-    if (row == 1) {
         printf("%d total valid moves\n", num_valid_moves);
+        printf("    placed at %d %d\n", which_row, which_col);
+        SET_STONE_AT(b, which_row, which_col, color);
     }
 }
 
@@ -146,7 +175,7 @@ int main(void)
     setup_random<<<1, 10>>>(randstates);
     clear_board<<<1, 32>>>((Board *) cuboard);
 
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < 150; i++) {
         make_random_move<<<1, 32>>>((Board *) cuboard, BLACK, randstates);
         make_random_move<<<1, 32>>>((Board *) cuboard, WHITE, randstates);
     }
@@ -154,9 +183,28 @@ int main(void)
     cudaMemcpy(&board, cuboard, sizeof (Board), cudaMemcpyDeviceToHost);
 
     for(int i=0; i < 21; i++) {
+        printf ("%02d ", i);
         for(int j=0; j < 21; j++) {
             char c = stone_chars[STONE_AT(&board, i, j)];
-            printf("%c", c);
+            if (STONE_AT(&board, i, j) == EMPTY) {
+                if (SINGLE_EYE(&board, i, j, WHITE)) 
+                    if (FALSE_EYE(&board, i, j, WHITE)) {
+                        assert(! SINGLE_REAL_EYE(&board, i, j, WHITE));
+                        c = 'F';
+                    } else {
+                        assert(SINGLE_REAL_EYE(&board, i, j, WHITE));
+                        c = 'E';
+                    }
+                if (SINGLE_EYE(&board, i, j, BLACK))
+                    if (FALSE_EYE(&board, i, j, BLACK)) {
+                        assert(! SINGLE_REAL_EYE(&board, i, j, BLACK));
+                        c = 'F';
+                    } else {
+                        assert(SINGLE_REAL_EYE(&board, i, j, BLACK));
+                        c = 'E';
+                    }
+            }
+            printf(" %c", c);
         }
 
         printf("\n");
