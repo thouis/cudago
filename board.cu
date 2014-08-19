@@ -30,6 +30,7 @@ typedef struct board {
     };
     row rows[21];
     uint8_t flags;
+    uint8_t ko_row, ko_col;
 } Board;
 
 #define STONE_AT(b, r, c) ((b)->rows[r].s[c])
@@ -38,21 +39,28 @@ typedef struct board {
 #define OPPOSITE(color) ((color == WHITE) ? BLACK : WHITE)
 
 // XXX - TODO:
-// - ko detection - easy? : if we remove one stone, and the played stone is in atari, removed space is ko?
+// - ko detection - testing.
+// - create play_out() function that fills board for N-hundred moves (or until N rounds of no change?)
+// - write scoring function.
 // - is there an easy way to avoid playing in single eyes that are controlled by other player?
-//    Maybe: 
+//    Maybe:
 //        add WHITE_PERMANENT and BLACK_PERMANENT: if alive and has two real single-space eyes.
 //        don't play in single spaces surrounded by PERMANENTs.
-       
+
+
+#define IS_NEXT_TO(b, r, c, v)  ((STONE_AT(b, r + 1, c) == (v)) || \
+                                 (STONE_AT(b, r - 1, c) == (v)) || \
+                                 (STONE_AT(b, r, c + 1) == (v)) || \
+                                 (STONE_AT(b, r, c - 1) == (v)))
+
+#define CT_NEXT_TO(b, r, c, v)  ((STONE_AT(b, r + 1, c) == (v)) + \
+                                 (STONE_AT(b, r - 1, c) == (v)) + \
+                                 (STONE_AT(b, r, c + 1) == (v)) + \
+                                 (STONE_AT(b, r, c - 1) == (v)))
+
 
 // SINGLE EYE == 4 horizontal & vertical neighbors are all the right color, or edge.
-#define COLOR_OR_EDGE_as_1(b, r, c, color) (((STONE_AT(b, r, c) == color) ? 1 : 0) +  \
-                                            ((STONE_AT(b, r, c) == EDGE) ? 1 : 0))
-
-#define SINGLE_EYE(b, r, c, color) ((COLOR_OR_EDGE_as_1(b, r + 1, c, color) +     \
-                                     COLOR_OR_EDGE_as_1(b, r - 1, c, color) +     \
-                                     COLOR_OR_EDGE_as_1(b, r, c + 1, color) +     \
-                                     COLOR_OR_EDGE_as_1(b, r, c - 1, color)) == 4)
+#define SINGLE_EYE(b, r, c, color) ((CT_NEXT_TO(b, r, c, color) + CT_NEXT_TO(b, r, c, EDGE)) == 4)
 
 
 // FALSE_EYE is only valid if SINGLE_EYE is true
@@ -63,12 +71,7 @@ typedef struct board {
                                         ((STONE_AT(b, r - 1, c + 1) == color) ? 1 : 0) + \
                                         ((STONE_AT(b, r - 1, c - 1) == color) ? 1 : 0))
 
-#define NEXT_TO(b, r, c, v)  ((STONE_AT(b, r + 1, c) == (v)) || \
-                              (STONE_AT(b, r - 1, c) == (v)) || \
-                              (STONE_AT(b, r, c + 1) == (v)) || \
-                              (STONE_AT(b, r, c - 1) == (v)))
-
-#define AT_EDGE(b, r, c) NEXT_TO(b, r, c, EDGE)
+#define AT_EDGE(b, r, c) IS_NEXT_TO(b, r, c, EDGE)
 
 #define FALSE_EYE(b, r, c, color)  ((DIAG_NEIGHBORS(b, r, c, OPPOSITE(color)) >= 2) || \
                                     ((DIAG_NEIGHBORS(b, r, c, OPPOSITE(color)) == 1) && AT_EDGE(b, r, c)))
@@ -78,8 +81,9 @@ typedef struct board {
 // (see Two-headed dragon @ sensei's library).
 #define SINGLE_REAL_EYE(b, r, c, color) (SINGLE_EYE(b, r, c, color) && (! FALSE_EYE(b, r, c, color)))
 
+#define ALIVE(b, row, c, alive_color) (IS_NEXT_TO(b, row, c, EMPTY) || IS_NEXT_TO(b, row, c, alive_color))
 
-#define ALIVE(b, row, c, alive_color) (NEXT_TO(b, row, c, EMPTY) || NEXT_TO(b, row, c, alive_color))
+#define LONE_ATARI(b, row, c, color) ((CT_NEXT_TO(b, row, c, EMPTY) == 1) && (! (IS_NEXT_TO(b, row, c, color))))
 
 
 __global__ void clear_board(Board *b)
@@ -96,14 +100,14 @@ __global__ void clear_board(Board *b)
     }
 }
 
-__device__ void remove_dead_groups(Board *b,
-                                   uint8_t color)
+__device__ int remove_dead_groups(Board *b,
+                                  uint8_t color)
 {
     // NB: we add because interior space on board is 1 indexed
     int row = threadIdx.x + 1;
     int num_changes;
     int alive_color = color + ALIVE_OFFSET;
-    
+
     // Loop until no new updates have been made
     num_changes = 1;
     while (num_changes > 0) {
@@ -142,10 +146,15 @@ __device__ void remove_dead_groups(Board *b,
     num_changes += __shfl_down(num_changes, 2);
     num_changes += __shfl_down(num_changes, 1);
 
+    // update all threads about total removed
+    num_changes = __shfl(num_changes, 0);
+
     if (row == 1) {
         if (num_changes > 0)
             printf("    removed %d stones\n", num_changes);
     }
+
+    return num_changes;
 }
 
 __global__ void make_random_move(Board *b,
@@ -153,13 +162,18 @@ __global__ void make_random_move(Board *b,
                                  curandState *randstate)
 {
     // NB: we add because interior space on board is 1 indexed
-    int row = threadIdx.x + 1; 
+    int row = threadIdx.x + 1;
 
     // local values
-    int num_valid_moves = 0;
-    int valid_move_mask = 0;
-    int which_row = 1;
+    int num_valid_moves;
+    int valid_move_mask;
+    int num_killed;
+    int num_suicide;
+
+    // where the random move is made
     int which_move = 0;
+    int which_row;
+    int which_col;
 
     // shared values
     __shared__ int thread_valid_moves[20];
@@ -168,17 +182,22 @@ __global__ void make_random_move(Board *b,
     // remember 1-indexed because of edges, and see NB above
     if (row > 19) return;
 
-
-
     // **************************************************
     // FIND VALID PLAY LOCATIONS
     // **************************************************
+    valid_move_mask = 0;
     for (int c = 1; c <= 19; c++) {
         if ((STONE_AT(b, row, c) == EMPTY) && (! SINGLE_REAL_EYE(b, row, c, color))) {
             valid_move_mask |= (1 << c);
-            num_valid_moves++;
         }
     }
+
+    // Disallow retaking the ko
+    if (row == b->ko_row) {
+        valid_move_mask &= ~ (1 << b->ko_col);
+    }
+
+    num_valid_moves = __popc(valid_move_mask);
     thread_valid_moves[row] = num_valid_moves;
 
     // figure out how many valid moves there were in the whole board
@@ -207,9 +226,9 @@ __global__ void make_random_move(Board *b,
             which_row++;
         }
     }
-    
+
     // all threads have to execute the shuffle
-    valid_move_mask = __shfl(valid_move_mask, which_row - 1);    
+    valid_move_mask = __shfl(valid_move_mask, which_row - 1);
 
     // **************************************************
     // MAKE RANDOM MOVE IN CHOSEN ROW
@@ -221,7 +240,7 @@ __global__ void make_random_move(Board *b,
             printf("BAD WHICH MOVE\n");
 
         // find which column to place move at
-        int which_col = 1;
+        which_col = 1;
         do {
             // shift which_col to the next set bit in valid_move_mask
             while (! (valid_move_mask & (1 << which_col)))
@@ -237,10 +256,22 @@ __global__ void make_random_move(Board *b,
     }
 
     // **************************************************
-    // REMOVE DEAD GROUPS
+    // REMOVE DEAD GROUPS & KO DETECTION
     // **************************************************
-    remove_dead_groups(b, OPPOSITE(color));
-    remove_dead_groups(b, color);
+    num_killed = remove_dead_groups(b, OPPOSITE(color));
+    num_suicide = remove_dead_groups(b, color);
+
+    if (row == 1) {
+        if ((num_killed == 1) && (num_suicide == 0) && LONE_ATARI(b, which_row, which_col, color)) {
+            if      (STONE_AT(b, which_row + 1, which_col) == EMPTY) { b->ko_row = which_row + 1; b->ko_col = which_col; }
+            else if (STONE_AT(b, which_row - 1, which_col) == EMPTY) { b->ko_row = which_row - 1; b->ko_col = which_col; }
+            else if (STONE_AT(b, which_row, which_col + 1) == EMPTY) { b->ko_row = which_row;     b->ko_col = which_col + 1; }
+            else if (STONE_AT(b, which_row, which_col - 1) == EMPTY) { b->ko_row = which_row;     b->ko_col = which_col - 1; }
+            printf("     ko at %d %d\n", b->ko_row, b->ko_col);
+         } else {
+            b->ko_row = b->ko_col = 0;
+        }
+    }
 
  end:
     return;
@@ -248,7 +279,7 @@ __global__ void make_random_move(Board *b,
 
 __global__ void setup_random(curandState *state)
 {
-    int id = threadIdx.x + blockIdx.x * 64; 
+    int id = threadIdx.x + blockIdx.x * 64;
     unsigned int seed = (unsigned int) clock64();
     curand_init(seed ^ id, id, 0, &state[id]);
 }
@@ -277,7 +308,7 @@ int main(void)
         for(int j=0; j < 21; j++) {
             char c = stone_chars[STONE_AT(&board, i, j)];
             if (STONE_AT(&board, i, j) == EMPTY) {
-                if (SINGLE_EYE(&board, i, j, WHITE)) 
+                if (SINGLE_EYE(&board, i, j, WHITE))
                     if (FALSE_EYE(&board, i, j, WHITE)) {
                         assert(! SINGLE_REAL_EYE(&board, i, j, WHITE));
                         c = 'F';
