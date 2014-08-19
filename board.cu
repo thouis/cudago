@@ -38,9 +38,12 @@ typedef struct board {
 #define OPPOSITE(color) ((color == WHITE) ? BLACK : WHITE)
 
 // XXX - TODO:
-// - add dead group removal -- flood fill aliveness - how many iterations and how to parallelize?
 // - ko detection - easy? : if we remove one stone, and the played stone is in atari, removed space is ko?
 // - is there an easy way to avoid playing in single eyes that are controlled by other player?
+//    Maybe: 
+//        add WHITE_PERMANENT and BLACK_PERMANENT: if alive and has two real single-space eyes.
+//        don't play in single spaces surrounded by PERMANENTs.
+       
 
 // SINGLE EYE == 4 horizontal & vertical neighbors are all the right color, or edge.
 #define COLOR_OR_EDGE_as_1(b, r, c, color) (((STONE_AT(b, r, c) == color) ? 1 : 0) +  \
