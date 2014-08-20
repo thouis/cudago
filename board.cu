@@ -101,10 +101,6 @@ __global__ void clear_board(Board *b)
     if (row == 0) {
         b->flags = 0;
         b->ko_row = 0;
-        SET_STONE_AT(b, 4, 4, WHITE);
-        SET_STONE_AT(b, 16, 16, WHITE);
-        SET_STONE_AT(b, 4, 16, BLACK);
-        SET_STONE_AT(b, 16, 4, BLACK);
     }
 }
 
@@ -384,7 +380,19 @@ int main(void)
 
     setup_random<<<COUNT, 1>>>(randstates);
     clear_board<<<1, 32>>>((Board *) start_board);
+    cudaMemcpy(&board, (Board *) start_board, sizeof (Board), cudaMemcpyDeviceToHost);
 
+    // Game #768554 - played out by gnugo.  3.5 at the end in chinese scoring.
+    char game[] = "[pd][dp][pq][dd][qk][lp][cj][cl][cg][gc][lc][jc][le][qc][qd][pc][nc][od][oc][rd][re][rc][qe][oe][qg][og][lg][oi][qi][ok][cn][dk][cq][cp][dq][ep][eq][fq][fr][gq][gr][hq][bp][bo][bq][bn][be][nq][po][li][pb][qb][ob][kh][mn][on][np][op][oo][no][mp][mo][mq][mr][nn][lo][om][pl][pp][lq][ln][ql][pm][kn][km][jm][jl][kl][lm][im][jk][lk][hk][ih][fk][gl][gk][fl][fh][ej][gi][kg][ek][dj][el][dh][dg][eg][eh][ci][ef][ge][gf][fe][if][ff][fg][hf][hg][gg][hh][ig][cc][dc][cb][kb][lb][lf][mf][kf][mg][me][ne][md][nd][nf][ke][mh][ng][of][ld][nh][mc][em][dl][dm][id][ic][rk][je][jd][ie][hd][cd][bd][qm][qn][hc][kc][me][md][ja][sb][hr][er][or][pr][ps][qs][os][qr][sm][rn][db][da][ea][ca][fb][rl][rm][sn][bh][bg][hl][il][jn][ch][bj][di][bi][hs][is][gs][ij][ik][ir][la][lh][me][jj][nk][nj][mk][mj][ol][pk][pj][pi][ph][oh][qj][oj][ll][kk][ce][hj][gj][hi][gh][pg][qh][ag][af][ah][ee][ed][sl][ap][aq][ao][na][gd][ei][de][df][qf][rf][pf][ka][jb][fj][ck][oq][np][gf][he][kd][pa][mb][co]";
+    int curcolor = BLACK;
+    for (int idx = 1; idx < sizeof(game); idx += 4) {
+        int c = game[idx] - 'a' + 1;
+        int r = game[idx + 1] - 'a' + 1;
+        SET_STONE_AT(&board, r, c, curcolor);
+        curcolor = OPPOSITE(curcolor);
+    }
+    cudaMemcpy((Board *) start_board, &board, sizeof (Board), cudaMemcpyHostToDevice);
+    
     
     cudaEventRecord(start, 0);
     play_out<<<COUNT, 32>>>((Board *) start_board, (Board *) playouts, 
@@ -397,6 +405,17 @@ int main(void)
     float delta_ms;
     cudaEventElapsedTime(&delta_ms, start, end);
     printf("%d boards in %0.2f ms\n", COUNT, delta_ms);
+
+
+    cudaMemcpy(&board, ((Board *) playouts), sizeof (Board), cudaMemcpyDeviceToHost);
+    for(int i = 0; i < 21; i++) {
+        for(int j = 0; j < 19; j++) {
+            printf("%c ", stone_chars[STONE_AT(&board, i, j)]);
+        }
+        printf("\n");
+    }
+    printf("\n");
+
 
     cudaMemcpy(&board, ((Board *) board_sum), sizeof (Board), cudaMemcpyDeviceToHost);
 
