@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <assert.h>
 
+#define LOG 0
+
 // We want to be able to hold a board in shared memory
 
 #define b00 0
@@ -21,6 +23,8 @@
 #define ALIVE_OFFSET 3
 
 const char stone_chars[] = ".#o ";
+
+#define NAME(color) ((color) == WHITE ? "white" : "black")
 
 typedef struct board {
     struct row {
@@ -149,17 +153,22 @@ __device__ int remove_dead_groups(Board *b,
     // update all threads about total removed
     num_changes = __shfl(num_changes, 0);
 
-    if (row == 1) {
+    if (LOG && (row == 1)) {
         if (num_changes > 0)
-            printf("    removed %d stones\n", num_changes);
+            printf("    removed %d %s stones\n", num_changes, NAME(color));
     }
 
+    // NB: all threads must return the same value for
+    // make_random_move() to work correctly.
     return num_changes;
 }
 
-__global__ void make_random_move(Board *b,
-                                 uint8_t color,
-                                 curandState *randstate)
+// **************************************************
+// Makes a random move and returns true if the board changed.
+// **************************************************
+__device__ int make_random_move(Board *b,
+                                uint8_t color,
+                                curandState *randstate)
 {
     // NB: we add because interior space on board is 1 indexed
     int row = threadIdx.x + 1;
@@ -180,7 +189,7 @@ __global__ void make_random_move(Board *b,
 
 
     // remember 1-indexed because of edges, and see NB above
-    if (row > 19) return;
+    if (row > 19) return 0;
 
     // **************************************************
     // FIND VALID PLAY LOCATIONS
@@ -210,8 +219,14 @@ __global__ void make_random_move(Board *b,
     // update all threads about valid move count
     num_valid_moves = __shfl(num_valid_moves, 0);
 
-    if (num_valid_moves == 0)
-        goto end;
+    if (num_valid_moves == 0) {
+        // forced pass
+
+        // clear ko flag
+        if (row == 1)
+            b->ko_row = 0;
+        return 0;  // no change in board
+    }
 
 
     // **************************************************
@@ -249,32 +264,77 @@ __global__ void make_random_move(Board *b,
                 which_col++;
             which_move--;
         } while (which_move >= 0);
-
-        printf("%d total valid moves\n", num_valid_moves);
-        printf("    placed at %d %d\n", which_row, which_col);
+        if (LOG) {
+            printf("%d total valid moves\n", num_valid_moves);
+            printf("    placed %s at %d %d\n", NAME(color), which_row, which_col);
+        }
         SET_STONE_AT(b, which_row, which_col, color);
     }
 
+    // update all threads about where we played
+    which_row = __shfl(which_row, 0);
+    which_col = __shfl(which_col, 0);
+    
     // **************************************************
     // REMOVE DEAD GROUPS & KO DETECTION
     // **************************************************
     num_killed = remove_dead_groups(b, OPPOSITE(color));
-    num_suicide = remove_dead_groups(b, color);
+
+    // only check for suicide moves if necessary
+    if ((num_killed == 0) && (! IS_NEXT_TO(b, which_row, which_col, EMPTY)))
+        num_suicide = remove_dead_groups(b, color);
+    else
+        num_suicide = 0;
+        
 
     if (row == 1) {
-        if ((num_killed == 1) && (num_suicide == 0) && LONE_ATARI(b, which_row, which_col, color)) {
+        if ((num_killed == 1) && LONE_ATARI(b, which_row, which_col, color)) {
             if      (STONE_AT(b, which_row + 1, which_col) == EMPTY) { b->ko_row = which_row + 1; b->ko_col = which_col; }
             else if (STONE_AT(b, which_row - 1, which_col) == EMPTY) { b->ko_row = which_row - 1; b->ko_col = which_col; }
             else if (STONE_AT(b, which_row, which_col + 1) == EMPTY) { b->ko_row = which_row;     b->ko_col = which_col + 1; }
             else if (STONE_AT(b, which_row, which_col - 1) == EMPTY) { b->ko_row = which_row;     b->ko_col = which_col - 1; }
-            printf("     ko at %d %d\n", b->ko_row, b->ko_col);
+            if (LOG) printf("     ko at %d %d\n", b->ko_row, b->ko_col);
          } else {
             b->ko_row = b->ko_col = 0;
         }
     }
 
- end:
-    return;
+    // NB: all threads will return the same value
+
+    // Return whether the board changed.
+    // The only way that didn't happen is if this was a single-stone suicide play.
+    return (num_suicide != 1);
+}
+
+__global__ void play_out(Board *start_board,
+                         Board *boards,
+                         uint8_t first_move_color,
+                         int max_moves,
+                         int max_unchanged,
+                         curandState *randstate)
+{
+    int move_count = 0;
+    int unchanged_count = 0;
+    uint8_t current_color = first_move_color;
+
+    Board *my_board = boards + blockIdx.x;
+
+    // NB: we add because interior space on board is 1 indexed
+    int row = threadIdx.x + 1;
+
+    if (row > 19) return;
+
+    if (row == 1)
+        *my_board = *start_board;
+
+    while ((move_count < max_moves) && (unchanged_count < max_unchanged)) {
+        move_count++;
+        int board_changed = make_random_move(my_board, current_color, randstate);
+        unchanged_count = board_changed ? 0 : (unchanged_count + 1);
+        current_color = OPPOSITE(current_color);
+        if (LOG && (row == 1))
+            printf("unchanged: %d, move_count: %d\n", unchanged_count, move_count);
+    }
 }
 
 __global__ void setup_random(curandState *state)
@@ -284,50 +344,56 @@ __global__ void setup_random(curandState *state)
     curand_init(seed ^ id, id, 0, &state[id]);
 }
 
+#define COUNT 10000
+
 int main(void)
 {
     void *cuboard;
+    void *playouts;
     Board board;
     curandState *randstates;
 
     cudaMalloc(&cuboard, sizeof (Board));
+    cudaMalloc(&playouts, COUNT * sizeof (Board));
     cudaMalloc(&randstates, 10 * sizeof(curandState));
 
     setup_random<<<1, 10>>>(randstates);
     clear_board<<<1, 32>>>((Board *) cuboard);
 
-    for (int i = 0; i < 500; i++) {
-        make_random_move<<<1, 32>>>((Board *) cuboard, BLACK, randstates);
-        make_random_move<<<1, 32>>>((Board *) cuboard, WHITE, randstates);
-    }
+    play_out<<<COUNT, 32>>>((Board *) cuboard, (Board *) playouts, 
+                            BLACK, 1000, 100, randstates);
 
-    cudaMemcpy(&board, cuboard, sizeof (Board), cudaMemcpyDeviceToHost);
 
-    for(int i=0; i < 21; i++) {
-        printf ("%02d ", i);
-        for(int j=0; j < 21; j++) {
-            char c = stone_chars[STONE_AT(&board, i, j)];
-            if (STONE_AT(&board, i, j) == EMPTY) {
-                if (SINGLE_EYE(&board, i, j, WHITE))
-                    if (FALSE_EYE(&board, i, j, WHITE)) {
-                        assert(! SINGLE_REAL_EYE(&board, i, j, WHITE));
-                        c = 'F';
-                    } else {
-                        assert(SINGLE_REAL_EYE(&board, i, j, WHITE));
-                        c = 'E';
-                    }
-                if (SINGLE_EYE(&board, i, j, BLACK))
-                    if (FALSE_EYE(&board, i, j, BLACK)) {
-                        assert(! SINGLE_REAL_EYE(&board, i, j, BLACK));
-                        c = 'F';
-                    } else {
-                        assert(SINGLE_REAL_EYE(&board, i, j, BLACK));
-                        c = 'E';
-                    }
+    for (int b = 0; b < 5; b++) {
+        cudaMemcpy(&board, ((Board *) playouts) + b, sizeof (Board), cudaMemcpyDeviceToHost);
+
+        for(int i=0; i < 21; i++) {
+            printf ("%02d ", i);
+            for(int j=0; j < 21; j++) {
+                char c = stone_chars[STONE_AT(&board, i, j)];
+                if (STONE_AT(&board, i, j) == EMPTY) {
+                    if (SINGLE_EYE(&board, i, j, WHITE))
+                        if (FALSE_EYE(&board, i, j, WHITE)) {
+                            assert(! SINGLE_REAL_EYE(&board, i, j, WHITE));
+                            c = 'F';
+                        } else {
+                            assert(SINGLE_REAL_EYE(&board, i, j, WHITE));
+                            c = 'E';
+                        }
+                    if (SINGLE_EYE(&board, i, j, BLACK))
+                        if (FALSE_EYE(&board, i, j, BLACK)) {
+                            assert(! SINGLE_REAL_EYE(&board, i, j, BLACK));
+                            c = 'F';
+                        } else {
+                            assert(SINGLE_REAL_EYE(&board, i, j, BLACK));
+                            c = 'E';
+                        }
+                }
+                printf(" %c", c);
             }
-            printf(" %c", c);
-        }
 
+            printf("\n");
+        }
         printf("\n");
     }
 
