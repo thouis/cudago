@@ -30,7 +30,7 @@ typedef struct board {
     struct col {
         // Each col & row is 21 entries wide to allow for edges.
         // Values defined above
-        uint8_t rows[21];
+        uint32_t rows[21];
     };
     col cols[21];
     uint8_t flags;
