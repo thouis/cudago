@@ -101,7 +101,7 @@ __global__ void clear_board(Board *b)
     if (row == 0) {
         b->flags = 0;
         b->ko_row = 0;
-        SET_STONE_AT(b, 4, 4, WHITE);
+        SET_STONE_AT(b, 3, 3, WHITE);
         SET_STONE_AT(b, 16, 16, WHITE);
         SET_STONE_AT(b, 4, 16, BLACK);
         SET_STONE_AT(b, 16, 4, BLACK);
@@ -253,11 +253,6 @@ __device__ int make_random_move(Board *b,
     // MAKE RANDOM MOVE IN CHOSEN ROW
     // **************************************************
     if (row == 1) {
-        if (__popc(valid_move_mask) != thread_valid_moves[which_row])
-            printf("BAD POPC\n");
-        if (which_move >= thread_valid_moves[which_row])
-            printf("BAD WHICH MOVE\n");
-
         // find which column to place move at
         which_col = 1;
         do {
@@ -282,13 +277,15 @@ __device__ int make_random_move(Board *b,
     // **************************************************
     // REMOVE DEAD GROUPS & KO DETECTION
     // **************************************************
-    num_killed = remove_dead_groups(b, OPPOSITE(color));
+    num_killed = 0;
+    num_suicide = 0;
+
+    if (IS_NEXT_TO(b, which_row, which_col, OPPOSITE(color)))
+        num_killed = remove_dead_groups(b, OPPOSITE(color));
 
     // only check for suicide moves if necessary
     if ((num_killed == 0) && (! IS_NEXT_TO(b, which_row, which_col, EMPTY)))
         num_suicide = remove_dead_groups(b, color);
-    else
-        num_suicide = 0;
         
 
     if (row == 1) {
@@ -341,6 +338,26 @@ __global__ void play_out(Board *start_board,
     }
 }
 
+__global__ void sum_boards(Board *start_board,
+                           int num_boards,
+                           Board *dest_board)
+{
+    int row = threadIdx.x + 1;
+    int col = threadIdx.y + 1;
+    if ((row > 19) || (col > 19))
+        return;
+
+    int count = 0;
+
+    for (int i = 0; i < num_boards; i++) {
+        int color = STONE_AT(start_board + i, row, col);
+        if ((color == BLACK) || ((color == EMPTY) &&
+                                 IS_NEXT_TO(start_board + i, row, col, BLACK)))
+            count++;
+    }
+    SET_STONE_AT(dest_board, row, col, count);
+}
+
 __global__ void setup_random(curandState *states)
 {
     unsigned int id = blockIdx.x;
@@ -352,33 +369,28 @@ __global__ void setup_random(curandState *states)
 
 int main(void)
 {
-    void *cuboard;
-    void *playouts;
+    void *start_board, *playouts, *board_sum;
     Board board;
-    int counts[19][19];
     curandState *randstates;
     cudaEvent_t start, end;
 
-    cudaMalloc(&cuboard, sizeof (Board));
+    cudaMalloc(&start_board, sizeof (Board));
     cudaMalloc(&playouts, COUNT * sizeof (Board));
+    cudaMalloc(&board_sum, sizeof (Board));
     cudaMalloc(&randstates, COUNT * sizeof(curandState));
 
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
     setup_random<<<COUNT, 1>>>(randstates);
-    clear_board<<<1, 32>>>((Board *) cuboard);
-
-
-    for(int i=0; i < 19; i++)
-        for(int j=0; j < 19; j++)
-            counts[i][j] = 0;
-
+    clear_board<<<1, 32>>>((Board *) start_board);
 
     
     cudaEventRecord(start, 0);
-    play_out<<<COUNT, 32>>>((Board *) cuboard, (Board *) playouts, 
+    play_out<<<COUNT, 32>>>((Board *) start_board, (Board *) playouts, 
                             BLACK, 1000, 100, randstates);
+
+    sum_boards<<<1, dim3(19, 19)>>>((Board *) playouts, COUNT, (Board *) board_sum);
     cudaEventRecord(end, 0);
     cudaEventSynchronize(end);
 
@@ -386,25 +398,14 @@ int main(void)
     cudaEventElapsedTime(&delta_ms, start, end);
     printf("%d boards in %0.2f ms\n", COUNT, delta_ms);
 
+    cudaMemcpy(&board, ((Board *) board_sum), sizeof (Board), cudaMemcpyDeviceToHost);
 
-
-    for (int b = 0; b < COUNT; b++) {
-        cudaMemcpy(&board, ((Board *) playouts) + b, sizeof (Board), cudaMemcpyDeviceToHost);
-        for(int i = 0; i < 19; i++) {
-            for(int j = 0; j < 19; j++) {
-                int s = STONE_AT(&board, i + 1, j + 1);
-                if (s == EMPTY)
-                    s = IS_NEXT_TO(&board, i + 1, j + 1, WHITE) ? WHITE : BLACK;
-                counts[i][j] += (s == BLACK) ? 1 : 0;
-            }
-        }
-    }
 
     printf("[");
     for(int i = 0; i < 19; i++) {
         printf ("[");
         for(int j = 0; j < 19; j++)
-            printf("%d,", counts[i][j]);
+            printf("%d,", STONE_AT(&board, i + 1, j + 1));
         printf("],\n");
     }
     printf("]");
