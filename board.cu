@@ -43,8 +43,8 @@ typedef struct board {
 #define OPPOSITE(color) ((color == WHITE) ? BLACK : WHITE)
 
 // XXX - TODO:
-// - ko detection - testing.
 // - write scoring function.
+// - ko detection - testing.
 // - is there an easy way to avoid playing in single eyes that are controlled by other player?
 //    Maybe:
 //        add WHITE_PERMANENT and BLACK_PERMANENT: if alive and has two real single-space eyes.
@@ -100,6 +100,11 @@ __global__ void clear_board(Board *b)
     }
     if (row == 0) {
         b->flags = 0;
+        b->ko_row = 0;
+        SET_STONE_AT(b, 4, 4, WHITE);
+        SET_STONE_AT(b, 16, 16, WHITE);
+        SET_STONE_AT(b, 4, 16, BLACK);
+        SET_STONE_AT(b, 16, 4, BLACK);
     }
 }
 
@@ -310,12 +315,12 @@ __global__ void play_out(Board *start_board,
                          uint8_t first_move_color,
                          int max_moves,
                          int max_unchanged,
-                         curandState *randstate)
+                         curandState *randstates)
 {
     int move_count = 0;
     int unchanged_count = 0;
     uint8_t current_color = first_move_color;
-
+    curandState *my_rand = randstates + blockIdx.x;
     Board *my_board = boards + blockIdx.x;
 
     // NB: we add because interior space on board is 1 indexed
@@ -328,7 +333,7 @@ __global__ void play_out(Board *start_board,
 
     while ((move_count < max_moves) && (unchanged_count < max_unchanged)) {
         move_count++;
-        int board_changed = make_random_move(my_board, current_color, randstate);
+        int board_changed = make_random_move(my_board, current_color, my_rand);
         unchanged_count = board_changed ? 0 : (unchanged_count + 1);
         current_color = OPPOSITE(current_color);
         if (LOG && (row == 1))
@@ -336,11 +341,11 @@ __global__ void play_out(Board *start_board,
     }
 }
 
-__global__ void setup_random(curandState *state)
+__global__ void setup_random(curandState *states)
 {
-    int id = threadIdx.x + blockIdx.x * 64;
+    unsigned int id = blockIdx.x;
     unsigned int seed = (unsigned int) clock64();
-    curand_init(seed ^ id, id, 0, &state[id]);
+    curand_init(seed ^ (id << 6), id, 0, &(states[id]));
 }
 
 #define COUNT 10000
@@ -350,18 +355,25 @@ int main(void)
     void *cuboard;
     void *playouts;
     Board board;
+    int counts[19][19];
     curandState *randstates;
     cudaEvent_t start, end;
 
     cudaMalloc(&cuboard, sizeof (Board));
     cudaMalloc(&playouts, COUNT * sizeof (Board));
-    cudaMalloc(&randstates, 10 * sizeof(curandState));
+    cudaMalloc(&randstates, COUNT * sizeof(curandState));
 
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
-    setup_random<<<1, 10>>>(randstates);
+    setup_random<<<COUNT, 1>>>(randstates);
     clear_board<<<1, 32>>>((Board *) cuboard);
+
+
+    for(int i=0; i < 19; i++)
+        for(int j=0; j < 19; j++)
+            counts[i][j] = 0;
+
 
     
     cudaEventRecord(start, 0);
@@ -375,38 +387,29 @@ int main(void)
     printf("%d boards in %0.2f ms\n", COUNT, delta_ms);
 
 
-    for (int b = 0; b < 5; b++) {
+
+    for (int b = 0; b < COUNT; b++) {
         cudaMemcpy(&board, ((Board *) playouts) + b, sizeof (Board), cudaMemcpyDeviceToHost);
-
-        for(int i=0; i < 21; i++) {
-            printf ("%02d ", i);
-            for(int j=0; j < 21; j++) {
-                char c = stone_chars[STONE_AT(&board, i, j)];
-                if (STONE_AT(&board, i, j) == EMPTY) {
-                    if (SINGLE_EYE(&board, i, j, WHITE))
-                        if (FALSE_EYE(&board, i, j, WHITE)) {
-                            assert(! SINGLE_REAL_EYE(&board, i, j, WHITE));
-                            c = 'F';
-                        } else {
-                            assert(SINGLE_REAL_EYE(&board, i, j, WHITE));
-                            c = 'E';
-                        }
-                    if (SINGLE_EYE(&board, i, j, BLACK))
-                        if (FALSE_EYE(&board, i, j, BLACK)) {
-                            assert(! SINGLE_REAL_EYE(&board, i, j, BLACK));
-                            c = 'F';
-                        } else {
-                            assert(SINGLE_REAL_EYE(&board, i, j, BLACK));
-                            c = 'E';
-                        }
-                }
-                printf(" %c", c);
+        for(int i = 0; i < 19; i++) {
+            for(int j = 0; j < 19; j++) {
+                int s = STONE_AT(&board, i + 1, j + 1);
+                if (s == EMPTY)
+                    s = IS_NEXT_TO(&board, i + 1, j + 1, WHITE) ? WHITE : BLACK;
+                counts[i][j] += (s == BLACK) ? 1 : 0;
             }
-
-            printf("\n");
         }
-        printf("\n");
     }
+
+    printf("[");
+    for(int i = 0; i < 19; i++) {
+        printf ("[");
+        for(int j = 0; j < 19; j++)
+            printf("%d,", counts[i][j]);
+        printf("],\n");
+    }
+    printf("]");
+
+
 
     cudaDeviceReset();
     return 0;
