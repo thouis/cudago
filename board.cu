@@ -101,7 +101,7 @@ __global__ void clear_board(Board *b)
     if (row == 0) {
         b->flags = 0;
         b->ko_row = 0;
-        SET_STONE_AT(b, 3, 3, WHITE);
+        SET_STONE_AT(b, 4, 4, WHITE);
         SET_STONE_AT(b, 16, 16, WHITE);
         SET_STONE_AT(b, 4, 16, BLACK);
         SET_STONE_AT(b, 16, 4, BLACK);
@@ -400,17 +400,19 @@ int main(void)
 
     cudaMemcpy(&board, ((Board *) board_sum), sizeof (Board), cudaMemcpyDeviceToHost);
 
+    int total = 0;
 
     printf("[");
     for(int i = 0; i < 19; i++) {
         printf ("[");
-        for(int j = 0; j < 19; j++)
+        for(int j = 0; j < 19; j++) {
             printf("%d,", STONE_AT(&board, i + 1, j + 1));
+            total += STONE_AT(&board, i + 1, j + 1);
+        }
         printf("],\n");
     }
-    printf("]");
-
-
+    printf("]\n");
+    printf("expected score (B over W): %f\n", 2 * (total / ((float) COUNT)) - 361.0);
 
     cudaDeviceReset();
     return 0;
