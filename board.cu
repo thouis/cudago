@@ -27,24 +27,23 @@ const char stone_chars[] = ".#o ";
 #define NAME(color) ((color) == WHITE ? "white" : "black")
 
 typedef struct board {
-    struct row {
-        // Each row is 21 entries wide to allow for edges.
+    struct col {
+        // Each col & row is 21 entries wide to allow for edges.
         // Values defined above
-        uint8_t s[21];
+        uint8_t rows[21];
     };
-    row rows[21];
+    col cols[21];
     uint8_t flags;
     uint8_t ko_row, ko_col;
 } Board;
 
-#define STONE_AT(b, r, c) ((b)->rows[r].s[c])
-#define SET_STONE_AT(b, r, c, v) ((b)->rows[r].s[c] = v)
+#define STONE_AT(b, r, c) ((b)->cols[c].rows[r])
+#define SET_STONE_AT(b, r, c, v) ((b)->cols[c].rows[r] = v)
 
 #define OPPOSITE(color) ((color == WHITE) ? BLACK : WHITE)
 
 // XXX - TODO:
 // - ko detection - testing.
-// - create play_out() function that fills board for N-hundred moves (or until N rounds of no change?)
 // - write scoring function.
 // - is there an easy way to avoid playing in single eyes that are controlled by other player?
 //    Maybe:
@@ -352,16 +351,28 @@ int main(void)
     void *playouts;
     Board board;
     curandState *randstates;
+    cudaEvent_t start, end;
 
     cudaMalloc(&cuboard, sizeof (Board));
     cudaMalloc(&playouts, COUNT * sizeof (Board));
     cudaMalloc(&randstates, 10 * sizeof(curandState));
 
+    cudaEventCreate(&start);
+    cudaEventCreate(&end);
+
     setup_random<<<1, 10>>>(randstates);
     clear_board<<<1, 32>>>((Board *) cuboard);
 
+    
+    cudaEventRecord(start, 0);
     play_out<<<COUNT, 32>>>((Board *) cuboard, (Board *) playouts, 
                             BLACK, 1000, 100, randstates);
+    cudaEventRecord(end, 0);
+    cudaEventSynchronize(end);
+
+    float delta_ms;
+    cudaEventElapsedTime(&delta_ms, start, end);
+    printf("%d boards in %0.2f ms\n", COUNT, delta_ms);
 
 
     for (int b = 0; b < 5; b++) {
