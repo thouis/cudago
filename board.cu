@@ -104,6 +104,9 @@ __global__ void clear_board(Board *b)
     }
 }
 
+// **************************************************
+// REMOVE DEAD GROUPS OF A GIVEN COLOR
+// **************************************************
 __device__ int remove_dead_groups(Board *b,
                                   uint8_t color)
 {
@@ -150,18 +153,81 @@ __device__ int remove_dead_groups(Board *b,
     num_changes += __shfl_down(num_changes, 2);
     num_changes += __shfl_down(num_changes, 1);
 
-    // update all threads about total removed
-    num_changes = __shfl(num_changes, 0);
-
     if (LOG && (row == 1)) {
         if (num_changes > 0)
             printf("    removed %d %s stones\n", num_changes, NAME(color));
     }
 
-    // NB: all threads must return the same value for
-    // make_random_move() to work correctly.
+    // NB: all threads must return the same value for functions below
+    // to work correctly.
+    //
+    // update all threads about total removed.
+    num_changes = __shfl(num_changes, 0);
     return num_changes;
 }
+
+// **************************************************
+// FIND VALID PLAY LOCATIONS
+//
+// return row-specific per-thread mask of valid moves
+// **************************************************
+__forceinline__ __device__ int find_valid_move_mask(Board *b, uint8_t color)
+{
+    // NB: we add because interior space on board is 1 indexed
+    int row = threadIdx.x + 1;
+    int valid_move_mask = 0;
+    
+    for (int c = 1; c <= 19; c++) {
+        if ((STONE_AT(b, row, c) == EMPTY) && (! SINGLE_REAL_EYE(b, row, c, color))) {
+            valid_move_mask |= (1 << c);
+        }
+    }
+
+    // Disallow retaking the ko
+    if (row == b->ko_row) {
+        valid_move_mask &= ~ (1 << b->ko_col);
+    }
+
+    return valid_move_mask;
+}
+
+// **************************************************
+// REMOVE DEAD GROUPS & KO DETECTION
+// 
+// returns whether the board changed
+// **************************************************
+__forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int which_col, uint8_t color)
+{
+    // NB: we add because interior space on board is 1 indexed
+    int row = threadIdx.x + 1;
+    int num_killed = 0;
+    int num_suicide = 0;
+
+    if (IS_NEXT_TO(b, which_row, which_col, OPPOSITE(color)))
+        num_killed = remove_dead_groups(b, OPPOSITE(color));
+
+    // only check for suicide moves if necessary
+    if ((num_killed == 0) && (! IS_NEXT_TO(b, which_row, which_col, EMPTY)))
+        num_suicide = remove_dead_groups(b, color);
+
+    if (row == 1) {
+        if ((num_killed == 1) && LONE_ATARI(b, which_row, which_col, color)) {
+            if      (STONE_AT(b, which_row + 1, which_col) == EMPTY) { b->ko_row = which_row + 1; b->ko_col = which_col; }
+            else if (STONE_AT(b, which_row - 1, which_col) == EMPTY) { b->ko_row = which_row - 1; b->ko_col = which_col; }
+            else if (STONE_AT(b, which_row, which_col + 1) == EMPTY) { b->ko_row = which_row;     b->ko_col = which_col + 1; }
+            else if (STONE_AT(b, which_row, which_col - 1) == EMPTY) { b->ko_row = which_row;     b->ko_col = which_col - 1; }
+            if (LOG) printf("     ko at %d %d\n", b->ko_row, b->ko_col);
+         } else {
+            b->ko_row = b->ko_col = 0;
+        }
+    }
+
+    // Return whether the board changed.
+    // The only way that didn't happen is if this was a single-stone suicide play.
+    // NB: all threads will return the same value due to 
+    return (num_suicide != 1);
+}
+
 
 // **************************************************
 // Makes a random move and returns true if the board changed.
@@ -176,8 +242,6 @@ __device__ int make_random_move(Board *b,
     // local values
     int num_valid_moves;
     int valid_move_mask;
-    int num_killed;
-    int num_suicide;
 
     // where the random move is made
     int which_move = 0;
@@ -191,21 +255,11 @@ __device__ int make_random_move(Board *b,
     // remember 1-indexed because of edges, and see NB above
     if (row > 19) return 0;
 
-    // **************************************************
-    // FIND VALID PLAY LOCATIONS
-    // **************************************************
-    valid_move_mask = 0;
-    for (int c = 1; c <= 19; c++) {
-        if ((STONE_AT(b, row, c) == EMPTY) && (! SINGLE_REAL_EYE(b, row, c, color))) {
-            valid_move_mask |= (1 << c);
-        }
-    }
+    valid_move_mask = find_valid_move_mask(b, color);
 
-    // Disallow retaking the ko
-    if (row == b->ko_row) {
-        valid_move_mask &= ~ (1 << b->ko_col);
-    }
-
+    // **************************************************
+    // COUNT VALID MOVES
+    // **************************************************
     num_valid_moves = __popc(valid_move_mask);
     thread_valid_moves[row] = num_valid_moves;
 
@@ -227,7 +281,6 @@ __device__ int make_random_move(Board *b,
             b->ko_row = 0;
         return 0;  // no change in board
     }
-
 
     // **************************************************
     // CHOOSE RANDOM ROW BASED ON VALID MOVE COUNTS
@@ -269,38 +322,9 @@ __device__ int make_random_move(Board *b,
     // update all threads about where we played
     which_row = __shfl(which_row, 0);
     which_col = __shfl(which_col, 0);
-    
-    // **************************************************
-    // REMOVE DEAD GROUPS & KO DETECTION
-    // **************************************************
-    num_killed = 0;
-    num_suicide = 0;
-
-    if (IS_NEXT_TO(b, which_row, which_col, OPPOSITE(color)))
-        num_killed = remove_dead_groups(b, OPPOSITE(color));
-
-    // only check for suicide moves if necessary
-    if ((num_killed == 0) && (! IS_NEXT_TO(b, which_row, which_col, EMPTY)))
-        num_suicide = remove_dead_groups(b, color);
-        
-
-    if (row == 1) {
-        if ((num_killed == 1) && LONE_ATARI(b, which_row, which_col, color)) {
-            if      (STONE_AT(b, which_row + 1, which_col) == EMPTY) { b->ko_row = which_row + 1; b->ko_col = which_col; }
-            else if (STONE_AT(b, which_row - 1, which_col) == EMPTY) { b->ko_row = which_row - 1; b->ko_col = which_col; }
-            else if (STONE_AT(b, which_row, which_col + 1) == EMPTY) { b->ko_row = which_row;     b->ko_col = which_col + 1; }
-            else if (STONE_AT(b, which_row, which_col - 1) == EMPTY) { b->ko_row = which_row;     b->ko_col = which_col - 1; }
-            if (LOG) printf("     ko at %d %d\n", b->ko_row, b->ko_col);
-         } else {
-            b->ko_row = b->ko_col = 0;
-        }
-    }
 
     // NB: all threads will return the same value
-
-    // Return whether the board changed.
-    // The only way that didn't happen is if this was a single-stone suicide play.
-    return (num_suicide != 1);
+    return find_dead_groups(b, which_row, which_col, color);
 }
 
 __global__ void play_out(Board *start_board,
@@ -378,8 +402,18 @@ int main(void)
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
+    cudaEventRecord(start, 0);
     setup_random<<<COUNT, 1>>>(randstates);
+    cudaEventRecord(end, 0);
+    cudaEventSynchronize(end);
+
+    float delta_ms;
+    cudaEventElapsedTime(&delta_ms, start, end);
+    printf("rand in %0.2f ms\n", delta_ms);
+
     clear_board<<<1, 32>>>((Board *) start_board);
+    
+
     cudaMemcpy(&board, (Board *) start_board, sizeof (Board), cudaMemcpyDeviceToHost);
 
     // Game #768554 - played out by gnugo.  3.5 at the end in chinese scoring.
@@ -402,7 +436,6 @@ int main(void)
     cudaEventRecord(end, 0);
     cudaEventSynchronize(end);
 
-    float delta_ms;
     cudaEventElapsedTime(&delta_ms, start, end);
     printf("%d boards in %0.2f ms\n", COUNT, delta_ms);
 
