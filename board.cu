@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <assert.h>
+#include <string.h>
 
 #define LOG 0
 
@@ -33,6 +34,7 @@ typedef struct board {
         uint32_t rows[21];
     };
     col cols[21];
+    uint8_t size;
     uint8_t flags;
     uint8_t ko_row, ko_col;
 } Board;
@@ -43,6 +45,8 @@ typedef struct board {
 #define OPPOSITE(color) ((color == WHITE) ? BLACK : WHITE)
 
 // XXX - TODO:
+// - dynamic board size
+// - fixed number of threads (set to board size)
 // - write scoring function.
 // - ko detection - testing.
 // - is there an easy way to avoid playing in single eyes that are controlled by other player?
@@ -89,16 +93,17 @@ typedef struct board {
 #define LONE_ATARI(b, row, c, color) ((CT_NEXT_TO(b, row, c, EMPTY) == 1) && (! (IS_NEXT_TO(b, row, c, color))))
 
 
-__global__ void clear_board(Board *b)
+__global__ void clear_board(Board *b, int board_size)
 {
     int row = threadIdx.x;
-    if (row < 21) {
-        SET_STONE_AT(b, row, 0, EDGE);
-        for (int c = 1; c <= 19; c++)
-            SET_STONE_AT(b, row, c, ((row == 0) || (row == 20)) ? EDGE : EMPTY);
-        SET_STONE_AT(b, row, 20, EDGE);
-    }
+    assert (blockDim.x == board_size + 2);
+
+    SET_STONE_AT(b, row, 0, EDGE);
+    for (int c = 1; c <= board_size; c++)
+        SET_STONE_AT(b, row, c, ((row == 0) || (row == board_size + 1)) ? EDGE : EMPTY);
+    SET_STONE_AT(b, row, board_size + 1, EDGE);
     if (row == 0) {
+        b->size = board_size;
         b->flags = 0;
         b->ko_row = 0;
     }
@@ -119,7 +124,7 @@ __device__ int remove_dead_groups(Board *b,
     num_changes = 1;
     while (num_changes > 0) {
         num_changes = 0;
-        for (int c = 1; c <= 19; c++) {
+        for (int c = 1; c <= b->size; c++) {
             if ((STONE_AT(b, row, c) == color) && ALIVE(b, row, c, alive_color)) {
                 SET_STONE_AT(b, row, c, alive_color);
                 num_changes++;
@@ -138,7 +143,7 @@ __device__ int remove_dead_groups(Board *b,
 
     // replace alive stones with stones of that color, and not-alive with empty.
     num_changes = 0;
-    for (int c = 1; c <= 19; c++) {
+    for (int c = 1; c <= b->size; c++) {
         if (STONE_AT(b, row, c) == color) {
             SET_STONE_AT(b, row, c, EMPTY);
             num_changes++;
@@ -177,7 +182,7 @@ __forceinline__ __device__ int find_valid_move_mask(Board *b, uint8_t color)
     int row = threadIdx.x + 1;
     int valid_move_mask = 0;
     
-    for (int c = 1; c <= 19; c++) {
+    for (int c = 1; c <= b->size; c++) {
         if ((STONE_AT(b, row, c) == EMPTY) && (! SINGLE_REAL_EYE(b, row, c, color))) {
             valid_move_mask |= (1 << c);
         }
@@ -252,9 +257,6 @@ __device__ int make_random_move(Board *b,
     __shared__ int thread_valid_moves[20];
 
 
-    // remember 1-indexed because of edges, and see NB above
-    if (row > 19) return 0;
-
     valid_move_mask = find_valid_move_mask(b, color);
 
     // **************************************************
@@ -327,6 +329,29 @@ __device__ int make_random_move(Board *b,
     return find_dead_groups(b, which_row, which_col, color);
 }
 
+__global__ void play_moves(Board *b, char *moves)
+{
+    // NB: we add because interior space on board is 1 indexed
+    int row = threadIdx.x + 1;
+    assert (blockDim.x == b->size);
+
+    int idx = 0;
+    while (moves[idx] != '\0') {
+        if (row == 1)
+            printf("move: %c%c%c\n", moves[idx], moves[idx+1], moves[idx+2]);
+        uint32_t color = (moves[idx] == 'B') ? BLACK : WHITE;
+        int which_row = moves[idx + 1] - 'a' + 1;
+        int which_col = moves[idx + 2] - 'a' + 1;
+        // passes are encoded as moves outside the board
+        if ((which_row == row) && (which_col <= b->size)) {
+            printf("moved %s at %d %d\n", NAME(color), which_row, which_col);
+            SET_STONE_AT(b, which_row, which_col, color);
+        }
+        find_dead_groups(b, which_row, which_col, color);
+        idx += 3;
+    }
+}
+
 __global__ void play_out(Board *start_board,
                          Board *boards,
                          uint8_t first_move_color,
@@ -340,10 +365,10 @@ __global__ void play_out(Board *start_board,
     curandState *my_rand = randstates + blockIdx.x;
     Board *my_board = boards + blockIdx.x;
 
+    assert (blockDim.x == start_board->size);
+
     // NB: we add because interior space on board is 1 indexed
     int row = threadIdx.x + 1;
-
-    if (row > 19) return;
 
     if (row == 1)
         *my_board = *start_board;
@@ -362,6 +387,7 @@ __global__ void sum_boards(Board *start_board,
                            int num_boards,
                            Board *dest_board)
 {
+    // NB: we add because interior space on board is 1 indexed
     int row = threadIdx.x + 1;
     int col = threadIdx.y + 1;
     if ((row > 19) || (col > 19))
@@ -378,6 +404,58 @@ __global__ void sum_boards(Board *start_board,
     SET_STONE_AT(dest_board, row, col, count);
 }
 
+__global__ void score_boards(Board *boards,
+                             float komi,
+                             int *results)
+{
+    Board *my_board = boards + blockIdx.x;
+
+    // NB: we add because interior space on board is 1 indexed
+    int row = threadIdx.x + 1;
+
+    assert (blockDim.x == my_board->size);
+
+    int count = 0;
+
+    for (int col = 1; col <= my_board->size; col++) {
+        int color = STONE_AT(my_board, row, col);
+        if ((color == BLACK) || ((color == EMPTY) &&
+                                 IS_NEXT_TO(my_board, row, col, BLACK)))
+            count++;
+        else 
+            count--;
+    }
+    count += __shfl_down(count, 16);
+    count += __shfl_down(count, 8);
+    count += __shfl_down(count, 4);
+    count += __shfl_down(count, 2);
+    count += __shfl_down(count, 1);
+
+    if (row == 1)
+        results[blockIdx.x] = (count + komi) > 0;
+}
+
+__global__ void sum_results(int *results, int len)
+{
+    int sum = 0;
+    int idx = threadIdx.x;
+    assert (blockDim.x == 32);
+
+    while (idx < len) {
+        sum += results[idx];
+        idx += 32;
+    }
+    printf("off %d sum %d\n", threadIdx.x, sum);
+    // don't need a syncthreads, as we only have 32 threads.
+    sum += __shfl_down(sum, 16);
+    sum += __shfl_down(sum, 8);
+    sum += __shfl_down(sum, 4);
+    sum += __shfl_down(sum, 2);
+    sum += __shfl_down(sum, 1);
+    if (threadIdx.x == 0)
+        results[0] = sum;
+}
+
 __global__ void setup_random(curandState *states)
 {
     unsigned int id = blockIdx.x;
@@ -385,87 +463,84 @@ __global__ void setup_random(curandState *states)
     curand_init(seed ^ (id << 6), id, 0, &(states[id]));
 }
 
-#define COUNT 10000
+#define PLAYOUT_COUNT 10000
 
-int main(void)
+int main(int argc, char *argv[])
 {
-    void *start_board, *playouts, *board_sum;
+    void *start_board, *playouts, *board_sum, *moves, *results;
     Board board;
     curandState *randstates;
     cudaEvent_t start, end;
+    float delta_ms;
 
+    // **************************************************
+    // PARSE ARGUMENTS
+    // **************************************************
+    if (argc != 5) {
+        printf("usage: board SIZE KOMI MOVES TO_PLAY\n");
+        exit(1);
+    }
+
+    int board_size = atoi(argv[1]);
+    assert (board_size <= 19);
+    float komi = atof(argv[2]);
+    char *_moves = argv[3];
+    int color_to_play = (*argv[4] == 'W') ? WHITE : BLACK;
+
+    // Copy moves to GPU
+    cudaMalloc(&moves, strlen(_moves) + 1);
+    cudaMemcpy((char *) moves, _moves, strlen(_moves) + 1, cudaMemcpyHostToDevice);
+
+    // allocate other scratch space
     cudaMalloc(&start_board, sizeof (Board));
-    cudaMalloc(&playouts, COUNT * sizeof (Board));
+    cudaMalloc(&playouts, PLAYOUT_COUNT * sizeof (Board));
     cudaMalloc(&board_sum, sizeof (Board));
-    cudaMalloc(&randstates, COUNT * sizeof(curandState));
+    cudaMalloc(&results, PLAYOUT_COUNT * sizeof(int));
+    cudaMalloc(&randstates, PLAYOUT_COUNT * sizeof(curandState));
 
     cudaEventCreate(&start);
     cudaEventCreate(&end);
 
-    cudaEventRecord(start, 0);
-    setup_random<<<COUNT, 1>>>(randstates);
-    cudaEventRecord(end, 0);
-    cudaEventSynchronize(end);
+    // initialize random states for each playout
+    setup_random<<<PLAYOUT_COUNT, 1>>>(randstates);
 
-    float delta_ms;
-    cudaEventElapsedTime(&delta_ms, start, end);
-    printf("rand in %0.2f ms\n", delta_ms);
+    // clear and initialize boards
+    clear_board<<<1, board_size + 2>>>((Board *) start_board, board_size);
+    play_moves<<<1, board_size>>>((Board *) start_board, (char *)moves);
 
-    clear_board<<<1, 32>>>((Board *) start_board);
-    
-
+    // print board
     cudaMemcpy(&board, (Board *) start_board, sizeof (Board), cudaMemcpyDeviceToHost);
 
-    // Game #768554 - played out by gnugo.  3.5 at the end in chinese scoring.
-    char game[] = "[pd][dp][pq][dd][qk][lp][cj][cl][cg][gc][lc][jc][le][qc][qd][pc][nc][od][oc][rd][re][rc][qe][oe][qg][og][lg][oi][qi][ok][cn][dk][cq][cp][dq][ep][eq][fq][fr][gq][gr][hq][bp][bo][bq][bn][be][nq][po][li][pb][qb][ob][kh][mn][on][np][op][oo][no][mp][mo][mq][mr][nn][lo][om][pl][pp][lq][ln][ql][pm][kn][km][jm][jl][kl][lm][im][jk][lk][hk][ih][fk][gl][gk][fl][fh][ej][gi][kg][ek][dj][el][dh][dg][eg][eh][ci][ef][ge][gf][fe][if][ff][fg][hf][hg][gg][hh][ig][cc][dc][cb][kb][lb][lf][mf][kf][mg][me][ne][md][nd][nf][ke][mh][ng][of][ld][nh][mc][em][dl][dm][id][ic][rk][je][jd][ie][hd][cd][bd][qm][qn][hc][kc][me][md][ja][sb][hr][er][or][pr][ps][qs][os][qr][sm][rn][db][da][ea][ca][fb][rl][rm][sn][bh][bg][hl][il][jn][ch][bj][di][bi][hs][is][gs][ij][ik][ir][la][lh][me][jj][nk][nj][mk][mj][ol][pk][pj][pi][ph][oh][qj][oj][ll][kk][ce][hj][gj][hi][gh][pg][qh][ag][af][ah][ee][ed][sl][ap][aq][ao][na][gd][ei][de][df][qf][rf][pf][ka][jb][fj][ck][oq][np][gf][he][kd][pa][mb][co]";
-    int curcolor = BLACK;
-    for (int idx = 1; idx < sizeof(game); idx += 4) {
-        int c = game[idx] - 'a' + 1;
-        int r = game[idx + 1] - 'a' + 1;
-        SET_STONE_AT(&board, r, c, curcolor);
-        curcolor = OPPOSITE(curcolor);
+    fprintf(stderr, "Generating move for:\n");
+    for(int i = 0; i < board_size + 2; i++) {
+        for(int j = 0; j < board_size; j++) {
+            fprintf(stderr, "%c ", stone_chars[STONE_AT(&board, i, j)]);
+        }
+        fprintf(stderr, "\n");
     }
-    cudaMemcpy((Board *) start_board, &board, sizeof (Board), cudaMemcpyHostToDevice);
-    
+    fprintf(stderr, "\n");
     
     cudaEventRecord(start, 0);
-    play_out<<<COUNT, 32>>>((Board *) start_board, (Board *) playouts, 
-                            BLACK, 1000, 100, randstates);
+    play_out<<<PLAYOUT_COUNT, board_size>>>((Board *) start_board, (Board *) playouts, 
+                                            color_to_play, 1000, 100, randstates);
 
-    sum_boards<<<1, dim3(19, 19)>>>((Board *) playouts, COUNT, (Board *) board_sum);
+    score_boards<<<PLAYOUT_COUNT, board_size>>>((Board *) playouts, komi, (int *) results);
+    int tmp[20];
+    cudaMemcpy(&tmp, results, 20 * sizeof(int), cudaMemcpyDeviceToHost);
+    printf("res ");
+    for (int kj = 0; kj < 20; kj ++)
+        printf("%d", tmp[kj]);
+    printf("\n");
+        
+
+    sum_results<<<1, 32>>>((int *) results, PLAYOUT_COUNT);
     cudaEventRecord(end, 0);
     cudaEventSynchronize(end);
 
-    cudaEventElapsedTime(&delta_ms, start, end);
-    printf("%d boards in %0.2f ms\n", COUNT, delta_ms);
-
-
-    cudaMemcpy(&board, ((Board *) playouts), sizeof (Board), cudaMemcpyDeviceToHost);
-    for(int i = 0; i < 21; i++) {
-        for(int j = 0; j < 19; j++) {
-            printf("%c ", stone_chars[STONE_AT(&board, i, j)]);
-        }
-        printf("\n");
-    }
-    printf("\n");
-
-
-    cudaMemcpy(&board, ((Board *) board_sum), sizeof (Board), cudaMemcpyDeviceToHost);
-
-    int total = 0;
-
-    printf("[");
-    for(int i = 0; i < 19; i++) {
-        printf ("[");
-        for(int j = 0; j < 19; j++) {
-            printf("%d,", STONE_AT(&board, i + 1, j + 1));
-            total += STONE_AT(&board, i + 1, j + 1);
-        }
-        printf("],\n");
-    }
-    printf("]\n");
-    printf("expected score (B over W): %f\n", 2 * (total / ((float) COUNT)) - 361.0);
+    int win_count;
+    cudaMemcpy(&win_count, results, sizeof(int), cudaMemcpyDeviceToHost);
+    printf("B wins %d out of %d\n", win_count, PLAYOUT_COUNT);
 
     cudaDeviceReset();
-    return 0;
+    exit(0);
 }
