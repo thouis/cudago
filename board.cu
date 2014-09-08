@@ -610,7 +610,9 @@ int main(int argc, char *argv[])
     cudaEventRecord(end, 0);
     cudaEventSynchronize(end);
 
-    if (best_i > 0) {
+    if (best_win < 0.1) {
+        printf("resign");
+    } else if (best_i > 0) {
         fprintf(stderr, "Playing at %d %d, expected win %f\n", best_i, best_j, best_win / (float) PLAYOUT_COUNT);
         printf("%d %d\n", best_j, best_i);
     } else {

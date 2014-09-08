@@ -34,8 +34,8 @@ class Wrapper(object):
         print "="
 
     def play(self, colorname, xy):
-        if xy == 'pass':
-            print "="
+        if xy in ['pass', 'resign']:
+            print "=", xy
             return
         c =  "B" if colorname.lower().startswith('b') else "W"
         X = sgf_letters[board_letters.index(xy[0].lower())]
