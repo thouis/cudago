@@ -216,10 +216,8 @@ __global__ void compute_valid_moves_board(Board *b_in, Board *b_out, uint8_t col
 // 
 // returns whether the board changed
 // **************************************************
-__forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int which_col, uint8_t color)
+__forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int which_col, uint8_t color, const int row)
 {
-    // NB: we add because interior space on board is 1 indexed
-    int row = threadIdx.x + 1;
     int num_killed = 0;
     int num_suicide = 0;
 
@@ -252,13 +250,11 @@ __forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int whi
 // **************************************************
 // Makes a random move and returns true if the board changed.
 // **************************************************
-__device__ int make_random_move(Board *b,
-                                uint8_t color,
-                                curandState *randstate)
+__device__ __inline__ int make_random_move(Board *b,
+                                           uint8_t color,
+                                           curandState *randstate,
+                                           const int row)
 {
-    // NB: we add because interior space on board is 1 indexed
-    int row = threadIdx.x + 1;
-
     // local values
     int num_valid_moves;
     int valid_move_mask;
@@ -270,7 +266,6 @@ __device__ int make_random_move(Board *b,
 
     // shared values
     __shared__ int thread_valid_moves[20];
-
 
     valid_move_mask = find_valid_move_mask(b, color);
 
@@ -341,7 +336,7 @@ __device__ int make_random_move(Board *b,
     which_col = __shfl(which_col, 0);
 
     // NB: all threads will return the same value
-    return find_dead_groups(b, which_row, which_col, color);
+    return find_dead_groups(b, which_row, which_col, color, row);
 }
 
 __global__ void play_moves(Board *b, char *moves)
@@ -364,7 +359,7 @@ __global__ void play_moves(Board *b, char *moves)
             assert (STONE_AT(b, which_row, which_col) == EMPTY);
             SET_STONE_AT(b, which_row, which_col, color);
         }
-        find_dead_groups(b, which_row, which_col, color);
+        find_dead_groups(b, which_row, which_col, color, row);
         idx += 3;
     }
 }
@@ -384,7 +379,7 @@ __global__ void make_one_move(Board *b_in, Board *b_out,
         assert (STONE_AT(b_out, which_row, which_col) == EMPTY);
         SET_STONE_AT(b_out, which_row, which_col, color);
     }
-    find_dead_groups(b_out, which_row, which_col, color);
+    find_dead_groups(b_out, which_row, which_col, color, row);
 }
 
 __global__ void play_out(Board *start_board,
@@ -397,7 +392,6 @@ __global__ void play_out(Board *start_board,
     int move_count = 0;
     int unchanged_count = 0;
     uint8_t current_color = first_move_color;
-    curandState *my_rand = randstates + blockIdx.x;
     Board *my_board = boards + blockIdx.x;
 
     assert (blockDim.x == start_board->size);
@@ -410,7 +404,7 @@ __global__ void play_out(Board *start_board,
 
     while ((move_count < max_moves) && (unchanged_count < max_unchanged)) {
         move_count++;
-        int board_changed = make_random_move(my_board, current_color, my_rand);
+        int board_changed = make_random_move(my_board, current_color, randstates + blockIdx.x, row);
         unchanged_count = board_changed ? 0 : (unchanged_count + 1);
         current_color = OPPOSITE(current_color);
         if (LOG && (row == 1))
@@ -498,7 +492,7 @@ __global__ void setup_random(curandState *states)
     curand_init(seed ^ (id << 6), id, 0, &(states[id]));
 }
 
-#define PLAYOUT_COUNT 10000
+#define PLAYOUT_COUNT 1000
 
 int main(int argc, char *argv[])
 {
@@ -543,6 +537,8 @@ int main(int argc, char *argv[])
 
     // clear and initialize boards
     clear_board<<<1, board_size + 2>>>((Board *) start_board, board_size);
+    clear_board<<<1, board_size + 2>>>((Board *) moves_board, board_size);
+
     play_moves<<<1, board_size>>>((Board *) start_board, (char *)moves);
 
     // find valid moves
@@ -579,10 +575,12 @@ int main(int argc, char *argv[])
     int best_win = 0;
     int best_i = -1;
     int best_j = -1;
+    int moves_tested = 0;
     cudaEventRecord(start, 0);
-    for(int i = 1; i <= board_size + 1; i++) {
-        for(int j = 1; j <= board_size + 1; j++) {
+    for(int i = 1; i <= board_size; i++) {
+        for(int j = 1; j <= board_size; j++) {
             if (STONE_AT(&board, i, j) == BLACK) {
+	        moves_tested++;
                 make_one_move<<<1, board_size>>>((Board *) start_board, (Board *) next_board,
                                                  i, j, color_to_play);
                 play_out<<<PLAYOUT_COUNT, board_size>>>((Board *) next_board, (Board *) playouts, 
@@ -603,14 +601,16 @@ int main(int argc, char *argv[])
                     best_j = j;
                     best_win = win_count;
                 }
+	        if (best_win > 0.95 * PLAYOUT_COUNT)
+		  goto done;
             }
-
         }
     }
     cudaEventRecord(end, 0);
     cudaEventSynchronize(end);
 
-    if (best_win < 0.1) {
+ done:
+    if ((moves_tested > 0) && (best_win < 0.1 * PLAYOUT_COUNT)) {
         printf("resign");
     } else if (best_i > 0) {
         fprintf(stderr, "Playing at %d %d, expected win %f\n", best_i, best_j, best_win / (float) PLAYOUT_COUNT);

@@ -1,6 +1,7 @@
 #!/usr/bin/python -u
 import sys
 import subprocess
+import os.path
 
 # gtp coords are letters *** except I ***, number (from lower left)
 board_letters = "abcdefghjklmnopqrstuvwxyz";
@@ -26,7 +27,9 @@ class Wrapper(object):
 
     def set_free_handicap(self, *args):
         for loc in args:
-            self.moves += "B" + loc
+            X = sgf_letters[board_letters.index(loc[0])]
+            Y = sgf_letters[self.size - int(loc[1:])]
+            self.moves += "B" + X + Y
         print "="
 
     def komi(self, arg):
@@ -44,10 +47,11 @@ class Wrapper(object):
         print "="
 
     def genmove(self, arg):
+        sys.stderr.write("GENMOVE ->%s<-\n" % self.moves)
         color_to_play =  "B" if arg.lower().startswith('b') else "W"
         key = (self.size, self.moves, self.komi)
         if key not in self.old_moves:
-            result = subprocess.check_output(["/data/Ray/cudago/board",
+            result = subprocess.check_output([os.path.join(os.path.dirname(__file__), "board"),
                                               str(self.size),
                                               str(self.komi),
                                               str(self.moves),
@@ -96,7 +100,8 @@ class Wrapper(object):
             getattr(self, command)(*args)
             print ""
         else:
-            print "? Unknown command: %s" % command
+            sys.stderr.write("? Unknown command: %s" % command)
+            print "=\n"
 
 
 if __name__ == "__main__":
