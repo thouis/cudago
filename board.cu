@@ -4,6 +4,15 @@
 #include <assert.h>
 #include <string.h>
 
+#ifndef BOARD_SIZE
+#define BOARD_SIZE 9
+#endif
+
+#ifndef PLAYOUT_COUNT
+#define PLAYOUT_COUNT 2500
+#endif
+
+
 #define LOG 0
 
 // We want to be able to hold a board in shared memory
@@ -29,12 +38,11 @@ const char stone_chars[] = ".#o ";
 
 typedef struct board {
     struct col {
-        // Each col & row is 21 entries wide to allow for edges.
+        // Each col & row is +2 entries wide to allow for edges.
         // Values defined above
-        uint32_t rows[21];
+        uint32_t rows[BOARD_SIZE + 2];
     };
-    col cols[21];
-    uint8_t size;
+    col cols[BOARD_SIZE + 2];
     uint8_t flags;
     uint8_t ko_row, ko_col;
 } Board;
@@ -90,17 +98,16 @@ typedef struct board {
 #define LONE_ATARI(b, row, c, color) ((CT_NEXT_TO(b, row, c, EMPTY) == 1) && (! (IS_NEXT_TO(b, row, c, color))))
 
 
-__global__ void clear_board(Board *b, int board_size)
+__global__ void clear_board(Board *b)
 {
     int row = threadIdx.x;
-    assert (blockDim.x == board_size + 2);
+    assert (blockDim.x == BOARD_SIZE + 2);
 
     SET_STONE_AT(b, row, 0, EDGE);
-    for (int c = 1; c <= board_size; c++)
-        SET_STONE_AT(b, row, c, ((row == 0) || (row == board_size + 1)) ? EDGE : EMPTY);
-    SET_STONE_AT(b, row, board_size + 1, EDGE);
+    for (int c = 1; c <= BOARD_SIZE; c++)
+        SET_STONE_AT(b, row, c, ((row == 0) || (row == BOARD_SIZE + 1)) ? EDGE : EMPTY);
+    SET_STONE_AT(b, row, BOARD_SIZE + 1, EDGE);
     if (row == 0) {
-        b->size = board_size;
         b->flags = 0;
         b->ko_row = 0;
     }
@@ -114,121 +121,63 @@ __device__ int remove_dead_groups(Board *b,
 {
     // NB: we add because interior space on board is 1 indexed
     int row = threadIdx.x + 1;
-    int num_changes;
+    int col = threadIdx.y + 1;
+
+    int changed;
     int alive_color = color + ALIVE_OFFSET;
 
     // Loop until no new updates have been made
-    num_changes = 1;
-    while (num_changes > 0) {
-        num_changes = 0;
-        for (int c = 1; c <= b->size; c++) {
-            if ((STONE_AT(b, row, c) == color) && ALIVE(b, row, c, alive_color)) {
-                SET_STONE_AT(b, row, c, alive_color);
-                num_changes++;
-            }
+    do {
+        changed = 0;
+        if ((STONE_AT(b, row, col) == color) && ALIVE(b, row, col, alive_color)) {
+            SET_STONE_AT(b, row, col, alive_color);
+            changed = 1;
         }
-        // figure out how many updates there were on the whole board
-        num_changes += __shfl_down(num_changes, 16);
-        num_changes += __shfl_down(num_changes, 8);
-        num_changes += __shfl_down(num_changes, 4);
-        num_changes += __shfl_down(num_changes, 2);
-        num_changes += __shfl_down(num_changes, 1);
-
-        // update all threads about total updates
-        num_changes = __shfl(num_changes, 0);
-    }
+        // find if any boards changed across threads.
+        changed = __syncthreads_or(changed);
+    } while (changed);
 
     // replace alive stones with stones of that color, and not-alive with empty.
-    num_changes = 0;
-    for (int c = 1; c <= b->size; c++) {
-        if (STONE_AT(b, row, c) == color) {
-            SET_STONE_AT(b, row, c, EMPTY);
-            num_changes++;
-        }
-        else if (STONE_AT(b, row, c) == alive_color)
-            SET_STONE_AT(b, row, c, color);
+    changed = 0;
+    if (STONE_AT(b, row, col) == color) {
+        SET_STONE_AT(b, row, col, EMPTY);
+        changed = 1;
+    } else if (STONE_AT(b, row, col) == alive_color) {
+        SET_STONE_AT(b, row, col, color);
     }
 
-    num_changes += __shfl_down(num_changes, 16);
-    num_changes += __shfl_down(num_changes, 8);
-    num_changes += __shfl_down(num_changes, 4);
-    num_changes += __shfl_down(num_changes, 2);
-    num_changes += __shfl_down(num_changes, 1);
-
-    if (LOG && (row == 1)) {
-        if (num_changes > 0)
-            printf("    removed %d %s stones\n", num_changes, NAME(color));
-    }
-
-    // NB: all threads must return the same value for functions below
-    // to work correctly.
-    //
-    // update all threads about total removed.
-    num_changes = __shfl(num_changes, 0);
-    return num_changes;
+    // find how many stones died
+    return __syncthreads_count(changed);
 }
-
-// **************************************************
-// FIND VALID PLAY LOCATIONS
-//
-// return row-specific per-thread mask of valid moves
-// **************************************************
-__forceinline__ __device__ int find_valid_move_mask(Board *b, uint8_t color)
-{
-    // NB: we add because interior space on board is 1 indexed
-    int row = threadIdx.x + 1;
-    int valid_move_mask = 0;
-    
-    for (int c = 1; c <= b->size; c++) {
-        if ((STONE_AT(b, row, c) == EMPTY) && (! SINGLE_REAL_EYE(b, row, c, color))) {
-            valid_move_mask |= (1 << c);
-        }
-    }
-
-    // Disallow retaking the ko
-    if (row == b->ko_row) {
-        valid_move_mask &= ~ (1 << b->ko_col);
-    }
-
-    return valid_move_mask;
-}
-
-// **************************************************
-// REPORT VALID PLAY LOCATIONS
-//
-// set a board to BLACK where moves can be played
-// **************************************************
-__global__ void compute_valid_moves_board(Board *b_in, Board *b_out, uint8_t color)
-{
-    int row = threadIdx.x + 1;
-    assert (blockDim.x == b_in->size);
-
-    int valid_move_mask = find_valid_move_mask(b_in, color);
-
-    for (int col = 1; col <= b_in->size; col++) {
-        SET_STONE_AT(b_out, row, col, (valid_move_mask & (1 << col)) ? BLACK : EMPTY);
-    }
-}
-
-
+ 
 // **************************************************
 // REMOVE DEAD GROUPS & KO DETECTION
 // 
 // returns whether the board changed
 // **************************************************
-__forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int which_col, uint8_t color, const int row)
+__forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int which_col, uint8_t color)
 {
+    int row = threadIdx.x + 1;
+    int col = threadIdx.y + 1;
+
     int num_killed = 0;
     int num_suicide = 0;
 
-    if (IS_NEXT_TO(b, which_row, which_col, OPPOSITE(color)))
-        num_killed = remove_dead_groups(b, OPPOSITE(color));
 
+    // remove_dead_groups will change the board, so we need to
+    // __syncthreads() between checking and calling.
+    int check_for_dead = IS_NEXT_TO(b, which_row, which_col, OPPOSITE(color));
+    __syncthreads(); 
+    if (check_for_dead) num_killed = remove_dead_groups(b, OPPOSITE(color));
+
+    // we don't need to syncthreads() here, because remove_dead_groups won't change EMPTYs.
+    //
     // only check for suicide moves if necessary
     if ((num_killed == 0) && (! IS_NEXT_TO(b, which_row, which_col, EMPTY)))
         num_suicide = remove_dead_groups(b, color);
 
-    if (row == 1) {
+    // update ko state
+    if ((row == which_row) && (col == which_col)) {
         if ((num_killed == 1) && LONE_ATARI(b, which_row, which_col, color)) {
             if      (STONE_AT(b, which_row + 1, which_col) == EMPTY) { b->ko_row = which_row + 1; b->ko_col = which_col; }
             else if (STONE_AT(b, which_row - 1, which_col) == EMPTY) { b->ko_row = which_row - 1; b->ko_col = which_col; }
@@ -239,10 +188,13 @@ __forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int whi
             b->ko_row = b->ko_col = 0;
         }
     }
+    
+    // sync to make sure ko state of board is updated.
+    __syncthreads();
 
     // Return whether the board changed.
     // The only way that didn't happen is if this was a single-stone suicide play.
-    // NB: all threads will return the same value due to 
+    // NB: all threads will return the same value.
     return (num_suicide != 1);
 }
 
@@ -252,134 +204,73 @@ __forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int whi
 // **************************************************
 __device__ __inline__ int make_random_move(Board *b,
                                            uint8_t color,
-                                           curandState *randstate,
-                                           const int row)
+                                           curandState *randstate)
 {
+    int row = threadIdx.x + 1;
+    int col = threadIdx.y + 1;
+
     // local values
-    int num_valid_moves;
-    int valid_move_mask;
+    int total_valid;
+    __shared__ int which_to_make, which_row, which_col;
 
-    // where the random move is made
-    int which_move = 0;
-    int which_row;
-    int which_col;
+    // index of thread in the current warp
+    const int warpidx = (threadIdx.x + threadIdx.y * blockDim.x) % 32;
 
-    // shared values
-    __shared__ int thread_valid_moves[20];
+    // is this row/col a valid move?
+    int is_valid = ((STONE_AT(b, row, col) == EMPTY) &&
+                    (! SINGLE_REAL_EYE(b, row, col, color)) &&
+                    ((b->ko_row != row) || (b->ko_col != col)));
+    
+    // get a count of number of valid moves in this warp
+    int warp_valid_mask = __ballot(is_valid);
+    int warp_valid_number = __popc(warp_valid_mask);
 
-    valid_move_mask = find_valid_move_mask(b, color);
+    // increment shared variable atomically, but only if at the head of a warp
+    total_valid = __syncthreads_count(is_valid);
 
-    // **************************************************
-    // COUNT VALID MOVES
-    // **************************************************
-    num_valid_moves = __popc(valid_move_mask);
-    thread_valid_moves[row] = num_valid_moves;
+    // if there were no possible moves, return that the board has not changed.
+    if (total_valid == 0) return 0;
+    
+    // have one thread choose a random value
+    if ((row == 1) && (col == 1))
+        which_to_make = curand(randstate) % total_valid;
 
-    // figure out how many valid moves there were in the whole board
-    num_valid_moves += __shfl_down(num_valid_moves, 16);
-    num_valid_moves += __shfl_down(num_valid_moves, 8);
-    num_valid_moves += __shfl_down(num_valid_moves, 4);
-    num_valid_moves += __shfl_down(num_valid_moves, 2);
-    num_valid_moves += __shfl_down(num_valid_moves, 1);
+    __syncthreads();  // wait for choice to be made
 
-    // update all threads about valid move count
-    num_valid_moves = __shfl(num_valid_moves, 0);
-
-    if (num_valid_moves == 0) {
-        // forced pass
-
-        // clear ko flag
-        if (row == 1)
-            b->ko_row = 0;
-        return 0;  // no change in board
+    // figure out which warp was chosen
+    //
+    // It's possible that warps could run in any order, but since we're
+    // choosing a move randomly, it doesn't really matter.
+    int this_warp_was_chosen = 0;
+    int old;
+    if (warpidx == 0) {
+        // atomicSub returns the old value
+        old = atomicSub(&which_to_make, warp_valid_number);
+        this_warp_was_chosen = (old >= 0) && (old < warp_valid_number);
     }
 
-    // **************************************************
-    // CHOOSE RANDOM ROW BASED ON VALID MOVE COUNTS
-    // **************************************************
-    if (row == 1) {
-        // choose one row to execute a move
-        which_move = curand(randstate) % num_valid_moves;
-        which_row = 1;
-        while (which_move >= thread_valid_moves[which_row]) {
-            which_move -= thread_valid_moves[which_row];
-            which_row++;
+    this_warp_was_chosen = __shfl(this_warp_was_chosen, 0);
+    old = __shfl(old, 0);
+
+    if (this_warp_was_chosen) {
+        // find a mask for all bits below this one to apply to valid_move_mask
+        unsigned int thread_below_mask = 1;
+        thread_below_mask <<= warpidx;
+        thread_below_mask -= 1;
+    
+        // if this square is a valid move, and the number of valid moves
+        // below this thread in the warp == old, this is the square to
+        // move at
+        if ((is_valid) && (__popc(thread_below_mask & warp_valid_mask) == old)) {
+            SET_STONE_AT(b, row, col, color);
+            which_row = row;
+            which_col = col;
         }
     }
-
-    // all threads have to execute the shuffle
-    valid_move_mask = __shfl(valid_move_mask, which_row - 1);
-
-    // **************************************************
-    // MAKE RANDOM MOVE IN CHOSEN ROW
-    // **************************************************
-    if (row == 1) {
-        // find which column to place move at
-        which_col = 1;
-        do {
-            // shift which_col to the next set bit in valid_move_mask
-            while (! (valid_move_mask & (1 << which_col)))
-                which_col++;
-            if (which_move > 0)
-                which_col++;
-            which_move--;
-        } while (which_move >= 0);
-        if (LOG) {
-            printf("%d total valid moves\n", num_valid_moves);
-            printf("    placed %s at %d %d\n", NAME(color), which_row, which_col);
-        }
-        SET_STONE_AT(b, which_row, which_col, color);
-    }
-
-    // update all threads about where we played
-    which_row = __shfl(which_row, 0);
-    which_col = __shfl(which_col, 0);
+    __syncthreads();
 
     // NB: all threads will return the same value
-    return find_dead_groups(b, which_row, which_col, color, row);
-}
-
-__global__ void play_moves(Board *b, char *moves)
-{
-    // NB: we add because interior space on board is 1 indexed
-    int row = threadIdx.x + 1;
-    assert (blockDim.x == b->size);
-
-    int idx = 0;
-    while (moves[idx] != '\0') {
-        if (LOG && (row == 1))
-            printf("move: %c%c%c\n", moves[idx], moves[idx+1], moves[idx+2]);
-        uint32_t color = (moves[idx] == 'B') ? BLACK : WHITE;
-        int which_col = moves[idx + 1] - 'a' + 1;
-        int which_row = moves[idx + 2] - 'a' + 1;
-        // passes are encoded as moves outside the board
-        if ((which_row == row) && (which_col <= b->size)) {
-            if (LOG)
-                printf("moved %s at %d %d\n", NAME(color), which_row, which_col);
-            assert (STONE_AT(b, which_row, which_col) == EMPTY);
-            SET_STONE_AT(b, which_row, which_col, color);
-        }
-        find_dead_groups(b, which_row, which_col, color, row);
-        idx += 3;
-    }
-}
-
-__global__ void make_one_move(Board *b_in, Board *b_out,
-                              int which_row, int which_col,
-                              uint8_t color)
-{
-    // NB: we add because interior space on board is 1 indexed
-    int row = threadIdx.x + 1;
-    assert (blockDim.x == b_in->size);
-
-    if (row == 1)
-        *b_out = *b_in;
-
-    if (which_row == row) {
-        assert (STONE_AT(b_out, which_row, which_col) == EMPTY);
-        SET_STONE_AT(b_out, which_row, which_col, color);
-    }
-    find_dead_groups(b_out, which_row, which_col, color, row);
+    return find_dead_groups(b, which_row, which_col, color);
 }
 
 __global__ void play_out(Board *start_board,
@@ -394,22 +285,79 @@ __global__ void play_out(Board *start_board,
     uint8_t current_color = first_move_color;
     Board *my_board = boards + blockIdx.x;
 
-    assert (blockDim.x == start_board->size);
+    assert (blockDim.x == BOARD_SIZE);
+    assert (blockDim.y == BOARD_SIZE);
 
     // NB: we add because interior space on board is 1 indexed
     int row = threadIdx.x + 1;
+    int col = threadIdx.y + 1;
 
-    if (row == 1)
+    if (row > BOARD_SIZE) return;
+    if (col > BOARD_SIZE) return;
+
+    if (row == 1 && col == 1)
         *my_board = *start_board;
+    __syncthreads();
 
-    while ((move_count < max_moves) && (unchanged_count < max_unchanged)) {
-        move_count++;
-        int board_changed = make_random_move(my_board, current_color, randstates + blockIdx.x, row);
+    while ((move_count < max_moves) && 
+           (unchanged_count < max_unchanged)) {
+        int board_changed = make_random_move(my_board, current_color, randstates + blockIdx.x);
+        // There is a syncthreads() at all exits of make_random_move(), so no need to sync here.
         unchanged_count = board_changed ? 0 : (unchanged_count + 1);
         current_color = OPPOSITE(current_color);
-        if (LOG && (row == 1))
-            printf("unchanged: %d, move_count: %d\n", unchanged_count, move_count);
+        move_count++;
     }
+}
+
+__global__ void play_moves(Board *b, char *moves)
+{
+    // NB: we add because interior space on board is 1 indexed
+    int row = threadIdx.x + 1;
+    int col = threadIdx.y + 1;
+
+    assert (blockDim.x == BOARD_SIZE);
+    assert (blockDim.y == BOARD_SIZE);
+
+    int idx = 0;
+    while (moves[idx] != '\0') {
+        if (LOG && (row == 1) && (col == 1))
+            printf("move: %c%c%c\n", moves[idx], moves[idx+1], moves[idx+2]);
+        uint32_t color = (moves[idx] == 'B') ? BLACK : WHITE;
+        int which_col = moves[idx + 1] - 'a' + 1;
+        int which_row = moves[idx + 2] - 'a' + 1;
+        // passes are encoded as moves outside the board
+        if ((which_row == row) && (which_col == col)) {
+            if (LOG)
+                printf("moved %s at %d %d\n", NAME(color), which_row, which_col);
+            assert (STONE_AT(b, which_row, which_col) == EMPTY);
+            SET_STONE_AT(b, which_row, which_col, color);
+        }
+        __syncthreads();
+        find_dead_groups(b, which_row, which_col, color);
+        idx += 3;
+    }
+}
+
+__global__ void make_one_move(Board *b_in, Board *b_out,
+                              int which_row, int which_col,
+                              uint8_t color)
+{
+    // NB: we add because interior space on board is 1 indexed
+    int row = threadIdx.x + 1;
+    int col = threadIdx.y + 1;
+    assert (blockDim.x == BOARD_SIZE);
+    assert (blockDim.y == BOARD_SIZE);
+
+    if ((row == 1) && (col == 1))
+        *b_out = *b_in;
+
+    __syncthreads();
+    if ((which_row == row) && (which_col == col)) {
+        assert (STONE_AT(b_out, which_row, which_col) == EMPTY);
+        SET_STONE_AT(b_out, which_row, which_col, color);
+    }
+    __syncthreads();
+    find_dead_groups(b_out, which_row, which_col, color);
 }
 
 __global__ void sum_boards(Board *start_board,
@@ -419,8 +367,8 @@ __global__ void sum_boards(Board *start_board,
     // NB: we add because interior space on board is 1 indexed
     int row = threadIdx.x + 1;
     int col = threadIdx.y + 1;
-    if ((row > 19) || (col > 19))
-        return;
+    assert (blockDim.x == BOARD_SIZE);
+    assert (blockDim.y == BOARD_SIZE);
 
     int count = 0;
 
@@ -441,28 +389,16 @@ __global__ void score_boards(Board *boards,
 
     // NB: we add because interior space on board is 1 indexed
     int row = threadIdx.x + 1;
+    int col = threadIdx.y + 1;
+    assert (blockDim.x == BOARD_SIZE);
+    assert (blockDim.y == BOARD_SIZE);
 
-    assert (blockDim.x == my_board->size);
-
-    int count = 0;
-
-    for (int col = 1; col <= my_board->size; col++) {
-        int color = STONE_AT(my_board, row, col);
-        if ((color == BLACK) || ((color == EMPTY) &&
-                                 IS_NEXT_TO(my_board, row, col, BLACK)))
-            count++;
-        else 
-            count--;
-    }
-    count += __shfl_down(count, 16);
-    count += __shfl_down(count, 8);
-    count += __shfl_down(count, 4);
-    count += __shfl_down(count, 2);
-    count += __shfl_down(count, 1);
-
-    // code above is for calculating B - W, so subtract komi
-    if (row == 1)
-        results[blockIdx.x] = (count - komi) > 0;
+    int color = STONE_AT(my_board, row, col);
+    int black_count = __syncthreads_count((color == BLACK) || 
+                                          ((color == EMPTY) && IS_NEXT_TO(my_board, row, col, BLACK)));
+    int white_count = BOARD_SIZE * BOARD_SIZE - black_count;
+    if ((row == 1) && (col == 1))
+        results[blockIdx.x] = (black_count > white_count + komi);
 }
 
 __global__ void sum_results(int *results, int len)
@@ -485,14 +421,31 @@ __global__ void sum_results(int *results, int len)
         results[0] = sum;
 }
 
+// **************************************************
+// REPORT VALID PLAY LOCATIONS
+//
+// set a board to BLACK where moves can be played
+// **************************************************
+__global__ void compute_valid_moves_board(Board *b_in, Board *b_out, uint8_t color)
+{
+    int row = threadIdx.x + 1;
+    assert (blockDim.x == BOARD_SIZE);
+
+    for (int col = 1; col <= BOARD_SIZE; col++) {
+        int valid = ((STONE_AT(b_in, row, col) == EMPTY) &&
+                    (! SINGLE_REAL_EYE(b_in, row, col, color)) &&
+                    ((b_in->ko_row != row) || (b_in->ko_col != col)));
+        SET_STONE_AT(b_out, row, col, valid ? BLACK : EMPTY);
+    }
+}
+
+
 __global__ void setup_random(curandState *states)
 {
     unsigned int id = blockIdx.x;
     unsigned int seed = (unsigned int) clock64();
     curand_init(seed ^ (id << 6), id, 0, &(states[id]));
 }
-
-#define PLAYOUT_COUNT 1000
 
 int main(int argc, char *argv[])
 {
@@ -510,8 +463,7 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    int board_size = atoi(argv[1]);
-    assert (board_size <= 19);
+    assert (atoi(argv[1]) == BOARD_SIZE);
     float komi = atof(argv[2]);
     char *_moves = argv[3];
     int color_to_play = (*argv[4] == 'W') ? WHITE : BLACK;
@@ -536,13 +488,13 @@ int main(int argc, char *argv[])
     setup_random<<<PLAYOUT_COUNT, 1>>>(randstates);
 
     // clear and initialize boards
-    clear_board<<<1, board_size + 2>>>((Board *) start_board, board_size);
-    clear_board<<<1, board_size + 2>>>((Board *) moves_board, board_size);
+    clear_board<<<1, BOARD_SIZE + 2>>>((Board *) start_board);
+    clear_board<<<1, BOARD_SIZE + 2>>>((Board *) moves_board);
 
-    play_moves<<<1, board_size>>>((Board *) start_board, (char *)moves);
+    play_moves<<<1, dim3(BOARD_SIZE, BOARD_SIZE)>>>((Board *) start_board, (char *)moves);
 
     // find valid moves
-    compute_valid_moves_board<<<1, board_size>>>((Board *) start_board,
+    compute_valid_moves_board<<<1, BOARD_SIZE>>>((Board *) start_board,
                                                  (Board *) moves_board,
                                                  color_to_play);
 
@@ -550,8 +502,8 @@ int main(int argc, char *argv[])
     cudaMemcpy(&board, (Board *) start_board, sizeof (Board), cudaMemcpyDeviceToHost);
 
     fprintf(stderr, "Generating move for %s on:\n", NAME(color_to_play));
-    for(int i = 0; i < board_size + 2; i++) {
-        for(int j = 0; j < board_size + 2; j++) {
+    for(int i = 0; i < BOARD_SIZE + 2; i++) {
+        for(int j = 0; j < BOARD_SIZE + 2; j++) {
             fprintf(stderr, "%c ", stone_chars[STONE_AT(&board, i, j)]);
         }
         fprintf(stderr, "\n");
@@ -562,8 +514,8 @@ int main(int argc, char *argv[])
     cudaMemcpy(&board, (Board *) moves_board, sizeof (Board), cudaMemcpyDeviceToHost);
 
     fprintf(stderr, "valid moves:\n");
-    for(int i = 0; i < board_size + 2; i++) {
-        for(int j = 0; j < board_size + 2; j++) {
+    for(int i = 0; i < BOARD_SIZE + 2; i++) {
+        for(int j = 0; j < BOARD_SIZE + 2; j++) {
             fprintf(stderr, "%c ", stone_chars[STONE_AT(&board, i, j)]);
         }
         fprintf(stderr, "\n");
@@ -571,24 +523,25 @@ int main(int argc, char *argv[])
     fprintf(stderr, "\n");
     
 
-    int num_boards_evaluated = 0;
     int best_win = 0;
     int best_i = -1;
     int best_j = -1;
     int moves_tested = 0;
     cudaEventRecord(start, 0);
-    for(int i = 1; i <= board_size; i++) {
-        for(int j = 1; j <= board_size; j++) {
+    for(int i = 1; i <= BOARD_SIZE; i++) {
+        for(int j = 1; j <= BOARD_SIZE; j++) {
             if (STONE_AT(&board, i, j) == BLACK) {
 	        moves_tested++;
-                make_one_move<<<1, board_size>>>((Board *) start_board, (Board *) next_board,
-                                                 i, j, color_to_play);
-                play_out<<<PLAYOUT_COUNT, board_size>>>((Board *) next_board, (Board *) playouts, 
-                                                        OPPOSITE(color_to_play), 1000, 100, randstates);
+                make_one_move<<<1, dim3(BOARD_SIZE, BOARD_SIZE)>>>((Board *) start_board, (Board *) next_board,
+                                                                   i, j, color_to_play);
 
-                score_boards<<<PLAYOUT_COUNT, board_size>>>((Board *) playouts, komi, (int *) results);
-                num_boards_evaluated++;
+                play_out<<<PLAYOUT_COUNT, dim3(BOARD_SIZE, BOARD_SIZE)>>>((Board *) next_board, (Board *) playouts, 
+                                                                                      OPPOSITE(color_to_play), 1000, 100, randstates);
+
+                score_boards<<<PLAYOUT_COUNT, dim3(BOARD_SIZE, BOARD_SIZE)>>>((Board *) playouts, komi, (int *) results);
+
                 sum_results<<<1, 32>>>((int *) results, PLAYOUT_COUNT);
+
                 int win_count;
                 cudaMemcpy(&win_count, results, sizeof(int), cudaMemcpyDeviceToHost);
                 if (color_to_play == WHITE)
@@ -603,12 +556,22 @@ int main(int argc, char *argv[])
                 }
 	        if (best_win > 0.95 * PLAYOUT_COUNT)
 		  goto done;
+
+
+                cudaError_t error = cudaGetLastError();
+                if(error != cudaSuccess) {
+                    printf("CUDA error: %s\n", cudaGetErrorString(error));
+                    exit(-1);
+                }
             }
         }
     }
     cudaEventRecord(end, 0);
     cudaEventSynchronize(end);
 
+    cudaEventElapsedTime(&delta_ms, start, end);
+    delta_ms /= moves_tested;
+    fprintf(stderr, "%f msecs per 1K moves playouts\n", (delta_ms * PLAYOUT_COUNT) / 1000);
  done:
     if ((moves_tested > 0) && (best_win < 0.1 * PLAYOUT_COUNT)) {
         printf("resign");
