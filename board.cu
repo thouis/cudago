@@ -4,6 +4,8 @@
 #include <assert.h>
 #include <string.h>
 
+#include "cuda_inline_ptx.h"
+
 #ifndef BOARD_SIZE
 #define BOARD_SIZE 9
 #endif
@@ -43,7 +45,6 @@ typedef struct board {
         uint32_t rows[BOARD_SIZE + 2];
     };
     col cols[BOARD_SIZE + 2];
-    uint8_t flags;
     uint8_t ko_row, ko_col;
 } Board;
 
@@ -108,7 +109,6 @@ __global__ void clear_board(Board *b)
         SET_STONE_AT(b, row, c, ((row == 0) || (row == BOARD_SIZE + 1)) ? EDGE : EMPTY);
     SET_STONE_AT(b, row, BOARD_SIZE + 1, EDGE);
     if (row == 0) {
-        b->flags = 0;
         b->ko_row = 0;
     }
 }
@@ -170,7 +170,9 @@ __forceinline__ __device__ int find_dead_groups(Board *b, int which_row, int whi
     __syncthreads(); 
     if (check_for_dead) num_killed = remove_dead_groups(b, OPPOSITE(color));
 
-    // we don't need to syncthreads() here, because remove_dead_groups won't change EMPTYs.
+    // we don't need to syncthreads() here, because remove_dead_groups
+    // won't create or remove EMPTYs until all threads are executing the
+    // function.
     //
     // only check for suicide moves if necessary
     if ((num_killed == 0) && (! IS_NEXT_TO(b, which_row, which_col, EMPTY)))
@@ -213,8 +215,8 @@ __device__ __inline__ int make_random_move(Board *b,
     int total_valid;
     __shared__ int which_to_make, which_row, which_col;
 
-    // index of thread in the current warp
-    const int warpidx = (threadIdx.x + threadIdx.y * blockDim.x) % 32;
+    // get our laneid for some tricks below...
+    const int laneid = __laneid();
 
     // is this row/col a valid move?
     int is_valid = ((STONE_AT(b, row, col) == EMPTY) &&
@@ -223,9 +225,9 @@ __device__ __inline__ int make_random_move(Board *b,
     
     // get a count of number of valid moves in this warp
     int warp_valid_mask = __ballot(is_valid);
-    int warp_valid_number = __popc(warp_valid_mask);
+    int warp_valid_count = __popc(warp_valid_mask);
 
-    // increment shared variable atomically, but only if at the head of a warp
+    // find the total number of valid moves
     total_valid = __syncthreads_count(is_valid);
 
     // if there were no possible moves, return that the board has not changed.
@@ -243,24 +245,24 @@ __device__ __inline__ int make_random_move(Board *b,
     // choosing a move randomly, it doesn't really matter.
     int this_warp_was_chosen = 0;
     int old;
-    if (warpidx == 0) {
+    if (laneid == 0) { // only the first thread in a warp chooses
         // atomicSub returns the old value
-        old = atomicSub(&which_to_make, warp_valid_number);
-        this_warp_was_chosen = (old >= 0) && (old < warp_valid_number);
+        old = atomicSub(&which_to_make, warp_valid_count);
+        this_warp_was_chosen = (old >= 0) && (old < warp_valid_count);
     }
 
+    // tell our warp if we were chosen, and which of the active threads was chosen
     this_warp_was_chosen = __shfl(this_warp_was_chosen, 0);
     old = __shfl(old, 0);
 
     if (this_warp_was_chosen) {
         // find a mask for all bits below this one to apply to valid_move_mask
         unsigned int thread_below_mask = 1;
-        thread_below_mask <<= warpidx;
+        thread_below_mask <<= laneid;
         thread_below_mask -= 1;
     
         // if this square is a valid move, and the number of valid moves
-        // below this thread in the warp == old, this is the square to
-        // move at
+        // below this thread in the warp == old, this is the thread to move at
         if ((is_valid) && (__popc(thread_below_mask & warp_valid_mask) == old)) {
             SET_STONE_AT(b, row, col, color);
             which_row = row;

@@ -51,7 +51,7 @@ class Wrapper(object):
         color_to_play =  "B" if arg.lower().startswith('b') else "W"
         key = (self.size, self.moves, self.komi)
         if key not in self.old_moves:
-            result = subprocess.check_output(["/home/ubuntu/cudago/board",
+            result = subprocess.check_output(["/home/ubuntu/cudago/board{}".format(self.size),
                                               str(self.size),
                                               str(self.komi),
                                               str(self.moves),
